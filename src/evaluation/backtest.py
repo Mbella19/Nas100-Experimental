@@ -229,26 +229,49 @@ def run_backtest(
     agent,
     env,
     initial_balance: float = 10000.0,
-    deterministic: bool = True
+    deterministic: bool = True,
+    start_idx: Optional[int] = None,
+    max_steps: Optional[int] = None
 ) -> BacktestResult:
     """
     Run a full backtest with the trained agent.
+
+    CRITICAL FIX: Now backtests on the FULL test set, not just a random 2000-step window!
+    - Pass start_idx to begin at the start of test set (not random)
+    - Set max_steps to cover entire test period (not default 2000)
 
     Args:
         agent: Trained SniperAgent
         env: Trading environment (should use test data)
         initial_balance: Starting balance
         deterministic: Use deterministic policy
+        start_idx: Starting index (if None, uses env.start_idx for full coverage)
+        max_steps: Max steps for episode (if None, uses remaining data length)
 
     Returns:
         BacktestResult with all metrics and trades
     """
     logger.info("Starting backtest...")
 
+    # Calculate backtest coverage
+    if start_idx is None:
+        start_idx = env.start_idx  # Start from beginning of available data
+
+    if max_steps is None:
+        max_steps = env.end_idx - start_idx  # Cover full test set
+
+    logger.info(f"Backtest coverage: start_idx={start_idx}, max_steps={max_steps} "
+                f"({max_steps * 15 / 60 / 24:.1f} days of 15m data)")
+
     backtester = Backtester(initial_balance=initial_balance)
     backtester.reset()
 
-    obs, info = env.reset()
+    # Temporarily override env.max_steps for full test coverage
+    original_max_steps = env.max_steps
+    env.max_steps = max_steps
+
+    # Reset with FIXED start_idx to ensure full test coverage (not random!)
+    obs, info = env.reset(options={'start_idx': start_idx})
     done = False
     truncated = False
     step = 0
@@ -280,6 +303,9 @@ def run_backtest(
         final_time = pd.Timestamp.now() + pd.Timedelta(minutes=15 * step)
         backtester._close_position(final_price, final_time)
         backtester.equity_history[-1] = backtester.balance
+
+    # Restore original max_steps
+    env.max_steps = original_max_steps
 
     results = backtester.get_results()
     logger.info(f"Backtest complete. {len(results.trades)} trades, "

@@ -160,6 +160,7 @@ class TradingEnv(gym.Env):
         self.steps = 0
         self.total_pnl = 0.0
         self.trades = []
+        self.prev_unrealized_pnl = 0.0  # Track for continuous PnL rewards
 
         # Precompute context vectors if analyst is provided
         self._precomputed_contexts = None
@@ -400,6 +401,23 @@ class TradingEnv(gym.Env):
                 reward -= self.spread_pips * new_size * self.reward_scaling  # Scaled cost
                 info['trade_opened'] = True
 
+        # CRITICAL FIX: Add unrealized PnL change to prevent "death spiral"
+        # Without this, holding a profitable trade in chop accumulates penalties
+        # while getting NO reward until exit (e.g., -10.0 penalties vs +2.0 exit reward)
+        # With this: agent gets continuous feedback on whether position is profitable
+        current_unrealized_pnl = self._calculate_unrealized_pnl()
+        pnl_delta = current_unrealized_pnl - self.prev_unrealized_pnl
+
+        if self.position != 0:
+            # Add the CHANGE in unrealized PnL to reward each step
+            # This balances chop/FOMO penalties with actual trade performance
+            reward += pnl_delta * self.reward_scaling
+            info['unrealized_pnl'] = current_unrealized_pnl
+            info['pnl_delta'] = pnl_delta
+
+        # Update for next step
+        self.prev_unrealized_pnl = current_unrealized_pnl
+
         # FOMO penalty: flat during high momentum move
         if self.position == 0:
             if price_move > self.fomo_threshold_atr * atr:
@@ -437,6 +455,7 @@ class TradingEnv(gym.Env):
         self.steps = 0
         self.total_pnl = 0.0
         self.trades = []
+        self.prev_unrealized_pnl = 0.0  # Reset for continuous PnL tracking
 
         return self._get_observation(), {}
 
