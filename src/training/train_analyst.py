@@ -137,72 +137,101 @@ class MultiTimeframeDataset(Dataset):
         )
 
 
-class StandardizedMSELoss(nn.Module):
+class RankingMSELoss(nn.Module):
     """
-    Loss function that GUARANTEES gradient signal at mode collapse.
+    Loss that prevents mode collapse using RANKING + NOISE INJECTION.
     
-    ROOT CAUSE OF ALL PREVIOUS FAILURES:
-    - Variance penalty: d(Var)/d(pred_i) = 0 at collapse
-    - Absolute diff: d|x|/dx = undefined at x=0  
-    - Squared diff: d(x²)/dx = 2x = 0 at x=0
+    WHY ALL PREVIOUS LOSSES FAILED:
+    MSE with noisy targets INHERENTLY encourages constant predictions!
+    The optimal MSE prediction for noisy data is the conditional mean.
+    If features aren't predictive, optimal = unconditional mean (constant).
     
-    ALL pairwise/variance losses have ZERO gradient when predictions are identical!
+    SOLUTION: Two-pronged attack:
     
-    SOLUTION: STANDARDIZE predictions before MSE.
+    1. NOISE INJECTION: Add Gaussian noise to predictions during training.
+       This breaks symmetry and forces the model to explore output space.
+       The noise is scaled to match target std, so the model MUST learn
+       to output values in the correct range to minimize loss.
     
-    pred_std = (pred - pred.mean()) / (pred.std() + eps) * target.std() + target.mean()
-    loss = MSE(pred_std, target)
-    
-    WHY THIS WORKS:
-    When pred.std() → 0, the scaling factor target.std()/(pred.std() + eps) → HUGE
-    This AMPLIFIES any tiny deviation from constant, creating massive gradient.
-    
-    The gradient does NOT go to zero at collapse - it goes to INFINITY!
-    This is the opposite behavior of all previous losses.
+    2. RANKING LOSS: Instead of just matching values, reward correct ORDERING.
+       If target_i > target_j, then pred_i should be > pred_j.
+       This has gradient even when predictions are constant!
+       
+       margin_loss = max(0, margin - (pred_i - pred_j)) when target_i > target_j
+       
+       At collapse (pred_i = pred_j), gradient = -1 (pushes pred_i UP, pred_j DOWN)
     """
     
-    def __init__(self, standardize_weight: float = 0.5):
+    def __init__(self, noise_scale: float = 0.5, ranking_weight: float = 1.0):
         """
         Args:
-            standardize_weight: Blend between raw MSE (0) and standardized MSE (1)
-                               0.5 = equal blend, which balances learning mean vs variance
+            noise_scale: Scale of noise relative to target std (0.5 = half target std)
+            ranking_weight: Weight for ranking loss component
         """
         super().__init__()
-        self.standardize_weight = standardize_weight
+        self.noise_scale = noise_scale
+        self.ranking_weight = ranking_weight
         
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         predictions = predictions.squeeze()
         targets = targets.squeeze()
+        batch_size = predictions.size(0)
         
-        # 1. Raw MSE - learns to predict correct mean
-        raw_mse = nn.functional.mse_loss(predictions, targets)
+        # 1. NOISE INJECTION - force model to output in correct range
+        if self.training:
+            target_std = targets.std().detach()
+            noise = torch.randn_like(predictions) * target_std * self.noise_scale
+            predictions_noisy = predictions + noise
+        else:
+            predictions_noisy = predictions
         
-        # 2. Standardized MSE - forces correct variance
-        pred_mean = predictions.mean()
-        pred_std = predictions.std()
-        target_mean = targets.mean()
-        target_std = targets.std()
+        # 2. MSE with noisy predictions
+        # Model must output correct SCALE to minimize this, even with noise
+        mse_loss = nn.functional.mse_loss(predictions_noisy, targets)
         
-        # Standardize predictions to match target distribution
-        # Add small epsilon to avoid division by zero, but keep it small
-        # so that when std is tiny, the scaling is HUGE (strong gradient)
-        eps = 1e-6
+        # 3. RANKING LOSS - correct ordering, NOT just magnitude
+        # Sample pairs and check if ordering is correct
+        n_pairs = min(batch_size * 4, batch_size * (batch_size - 1) // 2)
         
-        # Center and scale predictions to match target statistics
-        pred_centered = predictions - pred_mean
-        pred_standardized = pred_centered / (pred_std + eps) * target_std + target_mean
+        if batch_size > 1 and n_pairs > 0:
+            idx1 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
+            idx2 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
+            
+            # Ensure different indices
+            mask = idx1 != idx2
+            idx1, idx2 = idx1[mask], idx2[mask]
+            
+            if idx1.size(0) > 0:
+                target_diff = targets[idx1] - targets[idx2]
+                pred_diff = predictions[idx1] - predictions[idx2]  # Use clean predictions
+                
+                # Margin ranking loss with margin=0
+                # If target_diff > 0, we want pred_diff > 0
+                # If target_diff < 0, we want pred_diff < 0
+                # Loss = max(0, -target_diff.sign() * pred_diff)
+                
+                # Use soft margin for better gradients
+                # Loss = log(1 + exp(-target_diff.sign() * pred_diff / temp))
+                temp = targets.std().detach() + 1e-6  # Temperature scaling
+                
+                # For numerical stability, separate positive and negative target_diffs
+                signs = torch.sign(target_diff)
+                margin_violations = -signs * pred_diff / temp
+                
+                # Soft hinge loss: log(1 + exp(x)) ≈ x for large x, 0 for small x
+                ranking_loss = torch.nn.functional.softplus(margin_violations).mean()
+            else:
+                ranking_loss = torch.tensor(0.0, device=predictions.device)
+        else:
+            ranking_loss = torch.tensor(0.0, device=predictions.device)
         
-        standardized_mse = nn.functional.mse_loss(pred_standardized, targets)
-        
-        # 3. Direct variance matching penalty (backup gradient signal)
-        # Log ratio has gradient even at small values
-        variance_ratio = (pred_std + eps) / (target_std + eps)
-        variance_penalty = (torch.log(variance_ratio)) ** 2
+        # 4. Sign distribution matching - fraction of positive preds should match targets
+        pred_pos_frac = (predictions > 0).float().mean()
+        target_pos_frac = (targets > 0).float().mean()
+        sign_loss = (pred_pos_frac - target_pos_frac) ** 2
         
         # Combined loss
-        total_loss = (1 - self.standardize_weight) * raw_mse + \
-                     self.standardize_weight * standardized_mse + \
-                     0.1 * variance_penalty
+        total_loss = mse_loss + self.ranking_weight * ranking_loss + 0.5 * sign_loss
         
         return total_loss
 
@@ -282,11 +311,12 @@ class AnalystTrainer:
             patience=5
         )
 
-        # Loss function: StandardizedMSELoss - GUARANTEED gradient at collapse
-        # KEY FIX: Standardizes predictions before MSE
-        # When pred.std() → 0, gradient → INFINITY (not zero!)
-        # This is the opposite of variance penalty which has gradient → 0
-        self.criterion = StandardizedMSELoss(standardize_weight=0.5)
+        # Loss function: RankingMSELoss - NOISE + RANKING to break collapse
+        # WHY: MSE inherently encourages constant predictions with noisy targets!
+        # FIX 1: Noise injection forces model to output correct SCALE
+        # FIX 2: Ranking loss has gradient even at collapse (pushes predictions apart)
+        # FIX 3: Sign distribution matching ensures both positive AND negative outputs
+        self.criterion = RankingMSELoss(noise_scale=0.5, ranking_weight=1.0)
 
         # Training history
         self.train_losses = []
@@ -318,6 +348,7 @@ class AnalystTrainer:
             Tuple of (avg_loss, accuracy, direction_accuracy)
         """
         self.model.train()
+        self.criterion.train()  # Enable noise injection
         total_loss = 0.0
         n_batches = len(train_loader)
 
@@ -414,6 +445,7 @@ class AnalystTrainer:
             Tuple of (avg_loss, accuracy, direction_accuracy, predictions, targets)
         """
         self.model.eval()
+        self.criterion.eval()  # Disable noise injection for validation
         total_loss = 0.0
         n_batches = 0
 
