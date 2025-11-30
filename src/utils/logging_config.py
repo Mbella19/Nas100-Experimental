@@ -295,8 +295,9 @@ class TrainingLogger:
         self.logger.info("  Sample Predictions vs Targets:")
         indices = np.random.choice(len(predictions), min(sample_size, len(predictions)), replace=False)
         for i, idx in enumerate(indices):
-            pred = predictions[idx]
-            target = targets[idx]
+            # Convert to float to handle numpy arrays
+            pred = float(predictions[idx].item() if hasattr(predictions[idx], 'item') else predictions[idx])
+            target = float(targets[idx].item() if hasattr(targets[idx], 'item') else targets[idx])
             error = abs(pred - target)
             direction_match = "✓" if (pred > 0) == (target > 0) else "✗"
             self.logger.info(f"    [{i+1}] Pred: {pred:+.6f} | Target: {target:+.6f} | "
