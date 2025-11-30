@@ -162,14 +162,12 @@ class RankingMSELoss(nn.Module):
        At collapse (pred_i = pred_j), gradient = -1 (pushes pred_i UP, pred_j DOWN)
     """
     
-    def __init__(self, noise_scale: float = 0.5, ranking_weight: float = 1.0):
+    def __init__(self, ranking_weight: float = 1.0):
         """
         Args:
-            noise_scale: Scale of noise relative to target std (0.5 = half target std)
             ranking_weight: Weight for ranking loss component
         """
         super().__init__()
-        self.noise_scale = noise_scale
         self.ranking_weight = ranking_weight
         
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -177,61 +175,51 @@ class RankingMSELoss(nn.Module):
         targets = targets.squeeze()
         batch_size = predictions.size(0)
         
-        # 1. NOISE INJECTION - force model to output in correct range
-        if self.training:
-            target_std = targets.std().detach()
-            noise = torch.randn_like(predictions) * target_std * self.noise_scale
-            predictions_noisy = predictions + noise
-        else:
-            predictions_noisy = predictions
+        # 1. Raw MSE - learns magnitude
+        mse_loss = nn.functional.mse_loss(predictions, targets)
         
-        # 2. MSE with noisy predictions
-        # Model must output correct SCALE to minimize this, even with noise
-        mse_loss = nn.functional.mse_loss(predictions_noisy, targets)
-        
-        # 3. RANKING LOSS - correct ordering, NOT just magnitude
-        # Sample pairs and check if ordering is correct
+        # 2. RANKING LOSS - correct ordering
         n_pairs = min(batch_size * 4, batch_size * (batch_size - 1) // 2)
+        ranking_loss = torch.tensor(0.0, device=predictions.device)
         
         if batch_size > 1 and n_pairs > 0:
             idx1 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
             idx2 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
             
-            # Ensure different indices
             mask = idx1 != idx2
             idx1, idx2 = idx1[mask], idx2[mask]
             
             if idx1.size(0) > 0:
                 target_diff = targets[idx1] - targets[idx2]
-                pred_diff = predictions[idx1] - predictions[idx2]  # Use clean predictions
+                pred_diff = predictions[idx1] - predictions[idx2]
                 
-                # Margin ranking loss with margin=0
-                # If target_diff > 0, we want pred_diff > 0
-                # If target_diff < 0, we want pred_diff < 0
-                # Loss = max(0, -target_diff.sign() * pred_diff)
-                
-                # Use soft margin for better gradients
-                # Loss = log(1 + exp(-target_diff.sign() * pred_diff / temp))
-                temp = targets.std().detach() + 1e-6  # Temperature scaling
-                
-                # For numerical stability, separate positive and negative target_diffs
+                # Soft hinge loss
+                temp = targets.std().detach() + 1e-6
                 signs = torch.sign(target_diff)
                 margin_violations = -signs * pred_diff / temp
-                
-                # Soft hinge loss: log(1 + exp(x)) ≈ x for large x, 0 for small x
                 ranking_loss = torch.nn.functional.softplus(margin_violations).mean()
-            else:
-                ranking_loss = torch.tensor(0.0, device=predictions.device)
-        else:
-            ranking_loss = torch.tensor(0.0, device=predictions.device)
         
-        # 4. Sign distribution matching - fraction of positive preds should match targets
-        pred_pos_frac = (predictions > 0).float().mean()
+        # 3. SIGN LOSS (Fixed: Differentiable)
+        # Use sigmoid to approximate step function (pred > 0)
+        # High gain (100) makes it sharp but differentiable
+        pred_soft_sign = torch.sigmoid(predictions * 100.0)
+        pred_pos_frac = pred_soft_sign.mean()
         target_pos_frac = (targets > 0).float().mean()
+        
+        # Force fraction of positive predictions to match target fraction
         sign_loss = (pred_pos_frac - target_pos_frac) ** 2
         
+        # 4. VARIANCE LOSS - Force scale matching
+        pred_std = predictions.std()
+        target_std = targets.std().detach()
+        variance_loss = (pred_std - target_std) ** 2
+        
         # Combined loss
-        total_loss = mse_loss + self.ranking_weight * ranking_loss + 0.5 * sign_loss
+        # ranking_weight=1.0, sign_weight=1.0, var_weight=1.0
+        total_loss = mse_loss + \
+                     self.ranking_weight * ranking_loss + \
+                     1.0 * sign_loss + \
+                     1.0 * variance_loss
         
         return total_loss
 
@@ -311,12 +299,11 @@ class AnalystTrainer:
             patience=5
         )
 
-        # Loss function: RankingMSELoss - NOISE + RANKING to break collapse
-        # WHY: MSE inherently encourages constant predictions with noisy targets!
-        # FIX 1: Noise injection forces model to output correct SCALE
-        # FIX 2: Ranking loss has gradient even at collapse (pushes predictions apart)
-        # FIX 3: Sign distribution matching ensures both positive AND negative outputs
-        self.criterion = RankingMSELoss(noise_scale=0.5, ranking_weight=1.0)
+        # Loss function: RankingMSELoss - FORCED VARIANCE + RANKING
+        # FIX 1: Soft Sign Loss (Differentiable) fixes 100% positive collapse
+        # FIX 2: Variance Loss ((pred_std - target_std)^2) forces scale
+        # FIX 3: Ranking loss ensures correct relative ordering
+        self.criterion = RankingMSELoss(ranking_weight=1.0)
 
         # Training history
         self.train_losses = []
