@@ -18,7 +18,7 @@ This is a **hybrid trading system for EURUSD** combining supervised learning (Ma
 
 2. **Phase B - Sniper Agent (Reinforcement Learning)**
    - PPO policy consuming Analyst context + market state
-   - Actions: `[0: Flat/Exit, 1: Long, 2: Short]`
+   - Actions: `MultiDiscrete([3, 4])` - Direction [Flat/Exit, Long, Short] × Size [0.25x, 0.5x, 0.75x, 1.0x]
    - Reward engineering: PnL, transaction costs, FOMO penalty, chop avoidance
 
 ## Critical Hardware Constraints (Apple M2, 8GB RAM)
@@ -40,8 +40,10 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 ## Data Requirements
 
 - Source: EURUSD 1-minute OHLCV (5 years, ~2.6M rows)
+- Location: `/Users/gervaciusjr/Desktop/AI Trading Bot/Training data/eurusd_m1_5y_part2_no_gaps.csv`
 - Multi-timeframe: Resample 1m → 15m, 1H, 4H using forward-fill on complete datetime index
 - Gap handling: Create complete `pd.date_range()` index, then `.reindex().ffill()`
+- **CRITICAL**: All timeframes are aligned to the 15m index via forward-fill. 1H and 4H data are subsampled from this aligned index (every 4th and 16th bar respectively) to maintain temporal consistency.
 
 ## Feature Engineering Categories
 
@@ -62,19 +64,30 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 
 ### Trading Environment (src/environments/trading_env.py)
 
-**Action Space**: `gym.spaces.Discrete(3)`
-- `0`: Flat/Exit (if position != 0, close immediately)
-- `1`: Long (close short if exists, open long if flat)
-- `2`: Short (close long if exists, open short if flat)
+**Action Space**: `gym.spaces.MultiDiscrete([3, 4])`
+- Direction: `0`=Flat/Exit, `1`=Long, `2`=Short
+- Size: `0`=0.25x, `1`=0.5x, `2`=0.75x, `3`=1.0x
 
-**Observation Space**: `gym.spaces.Box` containing context vector + market features (all float32)
+**Observation Space**: `gym.spaces.Box` containing:
+- Context vector from Analyst (context_dim)
+- Position state: [position, entry_price_norm, unrealized_pnl_norm]
+- Market features (normalized): [atr, chop, adx, regime, sma_distance]
 
-**Reward Function**:
+**Reward Function** (CRITICAL - uses continuous PnL delta, not exit-only):
 ```python
-reward = pnl_pips - (SPREAD_PIPS if opened_trade else 0) + fomo_penalty + chop_penalty
-# FOMO: -0.5 if flat during high-momentum moves (|price_move| > 2*ATR)
-# Chop: -0.3 if holding position when CHOP > 60
+# Continuous PnL: reward based on CHANGE in unrealized PnL each step
+pnl_delta = current_unrealized_pnl - prev_unrealized_pnl
+reward = pnl_delta * reward_scaling  # reward_scaling = 0.1
+
+# Transaction cost when opening (NOT closing)
+if opened_trade:
+    reward -= spread_pips * position_size * reward_scaling
+
+# FOMO: -2.0 if flat during high-momentum moves (|price_move| > 2*ATR)
+# Chop: -1.0 if holding position when CHOP > 60
 ```
+
+**CRITICAL FIX**: The environment uses **continuous PnL rewards** (delta each step) instead of exit-only rewards to prevent "death spiral" where holding in choppy markets accumulates penalties with no offsetting reward until exit.
 
 ### PPO Agent (src/agents/sniper_agent.py)
 
@@ -159,33 +172,126 @@ except:
     agent = PPO("MlpPolicy", env, device="cpu")  # SB3 has limited MPS support
 ```
 
+## Critical Fixes & Recent Bug Resolutions
+
+**Look-Ahead Bias Prevention** (commits 830e97d, 7c0d6d2):
+- Feature normalization uses ONLY training data statistics (fit on first 70%, apply to all)
+- Market feature normalization in env uses pre-computed training stats
+- Test/eval environments receive training stats via `market_feat_mean` and `market_feat_std` parameters
+
+**Reward Function Fix** (commit ecf6ae8):
+- Changed from exit-only PnL rewards to **continuous PnL delta** each step
+- Prevents "death spiral" where penalties accumulate without offsetting rewards
+- `prev_unrealized_pnl` is reset to 0 when closing positions (critical for multi-trade episodes)
+
+**Multi-Timeframe Alignment** (commit 2c41eec):
+- All timeframes forward-filled to 15m index, then subsampled (1H=every 4th, 4H=every 16th)
+- `prepare_env_data()` and `create_env_from_dataframes()` correctly subsample aligned data
+
+**Normalization** (commit 53581a8):
+- Z-score normalization applied to ALL features (open, high, low, close, indicators)
+- Separate normalizers per timeframe (15m, 1H, 4H) saved to `models/analyst/normalizer_{tf}.pkl`
+- Prevents scale inconsistencies (ATR ~0.001 vs CHOP 0-100 vs price ~1.05)
+
 ## Common Pitfalls
 
 | Pitfall | Solution |
 |---------|----------|
 | OOM on M2 | Reduce batch size, gradient checkpointing |
 | float64 tensors | Enforce float32 everywhere |
-| Look-ahead bias | Features use only past data |
+| Look-ahead bias | Use ONLY training stats for normalization (all splits) |
 | Overfitting | Dropout, early stopping, validation split |
-| Passive agent | FOMO penalty, entropy bonus |
+| Passive agent | FOMO penalty, entropy bonus, continuous PnL rewards |
 | Over-trading | Transaction cost modeling |
 | Choppy markets | Chop avoidance penalty |
+| Death spiral in chop | Use continuous PnL delta, not exit-only rewards |
+| Timeframe misalignment | Forward-fill all to 15m, then subsample higher TFs |
 
 ## Validation Checklist
 
-- Multi-timeframe data aligned without NaN values
+- Multi-timeframe data aligned without NaN values (check after resampling and feature engineering)
+- Normalization: post-normalization feature ranges should be ~[-3, 3] (Z-score)
 - Analyst loss decreases, context vectors have variance (not collapsed)
-- Environment returns valid (obs, reward, done, info)
-- Agent explores diverse actions (not stuck on one)
+- Environment returns valid (obs, reward, done, info) with correct shapes
+- Agent explores diverse actions (not stuck on Flat=0, check action distribution logs)
 - Memory usage < 6GB, all tensors float32
-- No look-ahead bias in features
+- No look-ahead bias: normalization fitted on training data only, applied to all splits
+- Reward function: continuous PnL delta each step, NOT just on exit
+- `prev_unrealized_pnl` reset to 0 when closing positions
 
 ## Commands
 
 ```bash
-pip install -r requirements.txt          # Install dependencies
-python scripts/run_pipeline.py           # Full pipeline
+# Installation
+pip install -r requirements.txt
+
+# Full pipeline (data → Analyst → Agent → backtest)
+python scripts/run_pipeline.py
+
+# Skip steps with existing models
+python scripts/run_pipeline.py --skip-analyst    # Use existing Analyst
+python scripts/run_pipeline.py --skip-agent      # Use existing Agent
+python scripts/run_pipeline.py --backtest-only   # Only run backtest
+
+# Individual modules
 python -m src.training.train_analyst     # Train Analyst only
-python -m src.training.train_agent       # Train Agent only
-python -m src.evaluation.backtest        # Run backtest
+python -m src.training.train_agent       # Train Agent only (requires trained Analyst)
+python -m src.evaluation.backtest        # Run backtest only
+```
+
+## File Organization Specifics
+
+**Data Flow**:
+- Raw: `data/raw/eurusd_m1_5y_part2_no_gaps.csv` (external: `/Users/gervaciusjr/Desktop/AI Trading Bot/Training data/`)
+- Processed: `data/processed/features_{15m,1h,4h}.parquet` (pre-normalization)
+- Normalized: `data/processed/features_{15m,1h,4h}_normalized.parquet` (post-normalization)
+
+**Model Checkpoints**:
+- Analyst: `models/analyst/best.pt` (lowest val loss), `models/analyst/normalizer_{15m,1h,4h}.pkl`
+- Agent: `models/agent/final_model.zip` (SB3 format), `models/agent/agent_training_metrics.json`
+
+**Logging & Metrics**:
+- Training logs: `models/{analyst,agent}/training.log`
+- Visualizations: `models/agent/agent_training_summary.png`
+- Backtest results: `results/YYYYMMDD_HHMMSS/`
+
+## Key Architecture Details
+
+**Analyst Context Flow**:
+1. `TemporalEncoder` (Transformer or Conv1D) per timeframe → [batch, d_model]
+2. `AttentionFusion` combines encodings → [batch, d_model]
+3. `context_proj` (Linear + LayerNorm) → [batch, context_dim=64]
+4. During RL: context vector precomputed for all samples, cached in `TradingEnv._precomputed_contexts`
+
+**Environment Observation Construction** (trading_env.py:256):
+```python
+obs = [context_vector (64), position_state (3), market_features (5)]  # Total: 72 dims
+# position_state: [position {-1,0,1}, entry_price_norm, unrealized_pnl_norm]
+# market_features (Z-normalized): [atr, chop, adx, regime, sma_distance]
+```
+
+**Reward Scaling Logic** (config/settings.py:144):
+- `reward_scaling = 0.1` converts ±20 pip trade to ±2.0 reward
+- Makes penalties (-2.0 FOMO, -1.0 chop) meaningful vs PnL
+- Encourages "Sniper" behavior: selective, high-quality trades
+
+## Debugging & Monitoring
+
+**Agent Training Logs** (src/training/train_agent.py:38-337):
+- `AgentTrainingLogger` callback tracks episode rewards, PnL, win rates, action distributions
+- Logs every 10 episodes and every 5000 timesteps
+- Creates visualizations: reward curves, action distribution, cumulative PnL
+
+**Common Issues**:
+1. **Agent stuck on Flat (action=0)**: Check action distribution in logs. If >90% Flat, increase entropy coefficient (`ent_coef`) or reduce penalties
+2. **Divergent training**: Check for NaN in observations/rewards. Verify normalization applied correctly
+3. **OOM on MPS**: Reduce `batch_size` in config, increase `cache_clear_interval`
+4. **SB3 MPS errors**: Fallback to CPU for PPO training (MPS support limited in SB3)
+
+**Verifying No Look-Ahead Bias**:
+```python
+# Check normalization uses training stats only
+print(f"Train end: {train_end_idx}, Total samples: {len(df_15m)}")
+# Verify market_feat_mean/std computed from train_market_features[:split_idx]
+# Verify test env receives same train stats, NOT test stats
 ```

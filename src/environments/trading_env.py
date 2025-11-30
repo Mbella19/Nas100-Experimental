@@ -66,7 +66,8 @@ class TradingEnv(gym.Env):
         reward_scaling: float = 0.1,  # Scale PnL rewards to balance with penalties
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
-        market_feat_std: Optional[np.ndarray] = None    # Pre-computed from training data
+        market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
+        pre_windowed: bool = True  # FIXED: If True, data is already windowed (start_idx=0)
     ):
         """
         Initialize the trading environment.
@@ -119,8 +120,15 @@ class TradingEnv(gym.Env):
         self.max_steps = max_steps
         self.reward_scaling = reward_scaling  # Scale PnL to balance with penalties
 
-        # Calculate valid range (need enough lookback data)
-        self.start_idx = max(lookback_15m, lookback_1h * 4, lookback_4h * 16)
+        # Calculate valid range
+        # FIXED: If pre_windowed=True, data is already trimmed by prepare_env_data
+        # so start_idx should be 0 (no double offset)
+        if pre_windowed:
+            self.start_idx = 0
+        else:
+            # Only compute start_idx if using raw DataFrames (create_env_from_dataframes)
+            self.start_idx = max(lookback_15m, lookback_1h * 4, lookback_4h * 16)
+        
         self.end_idx = len(close_prices) - 1
         self.n_samples = self.end_idx - self.start_idx
 

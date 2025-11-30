@@ -116,6 +116,9 @@ def step_3_engineer_features(
 ) -> tuple:
     """
     Step 3: Apply feature engineering to all timeframes.
+    
+    FIXED: No longer drops NaN separately per timeframe.
+    Alignment is done AFTER feature engineering to preserve index consistency.
     """
     logger.info("=" * 60)
     logger.info("STEP 3: Feature Engineering")
@@ -139,6 +142,24 @@ def step_3_engineer_features(
     df_4h = engineer_all_features(df_4h, feature_config)
 
     logger.info(f"Features: {list(df_15m.columns)}")
+    
+    # CRITICAL FIX: Align timeframes by finding common valid (non-NaN) indices
+    # This ensures all three DataFrames have the same index after NaN removal
+    logger.info("Aligning timeframes after feature engineering...")
+    
+    # Find rows where ALL timeframes have valid data
+    valid_15m = ~df_15m.isna().any(axis=1)
+    valid_1h = ~df_1h.isna().any(axis=1)
+    valid_4h = ~df_4h.isna().any(axis=1)
+    common_valid = valid_15m & valid_1h & valid_4h
+    
+    initial_len = len(df_15m)
+    df_15m = df_15m[common_valid]
+    df_1h = df_1h[common_valid]
+    df_4h = df_4h[common_valid]
+    
+    logger.info(f"Dropped {initial_len - len(df_15m)} rows to align timeframes. Final: {len(df_15m):,} rows")
+    logger.info(f"All timeframes now aligned with identical indices.")
 
     # Save processed data (before normalization for reference)
     processed_path = config.paths.data_processed
@@ -150,6 +171,17 @@ def step_3_engineer_features(
     return df_15m, df_1h, df_4h
 
 
+# Columns that should NOT be normalized (used for PnL and reward thresholds)
+RAW_COLUMNS = ['open', 'high', 'low', 'close', 'volume', 'atr', 'chop', 'adx']
+
+# Columns that SHOULD be normalized for model input
+MODEL_INPUT_COLUMNS = [
+    'pinbar', 'engulfing', 'doji', 'ema_trend', 'ema_crossover',
+    'regime', 'returns', 'volatility', 'sma_distance',
+    'dist_to_resistance', 'dist_to_support'
+]
+
+
 def step_3b_normalize_features(
     df_15m: pd.DataFrame,
     df_1h: pd.DataFrame,
@@ -159,38 +191,71 @@ def step_3b_normalize_features(
 ) -> tuple:
     """
     Step 3b: Normalize features using StandardScaler (Z-Score).
+    
+    CRITICAL FIXES:
+    1. Only normalizes MODEL INPUT features (not OHLC, ATR, CHOP, ADX)
+    2. Uses 85% split to match analyst/agent training split (not config.data.train_ratio)
+    3. Returns BOTH normalized DataFrames AND raw columns for PnL/reward calculations
 
-    CRITICAL: This prevents large-scale features from dominating gradients.
-    Normalization is fit on TRAINING data only to prevent look-ahead bias.
+    This prevents large-scale features from dominating gradients while keeping
+    raw price/volatility values available for PnL calculations and reward thresholds.
     """
     logger.info("=" * 60)
     logger.info("STEP 3b: Feature Normalization (Z-Score)")
     logger.info("=" * 60)
 
-    # Calculate training split index
-    train_end_idx = int(len(df_15m) * config.data.train_ratio)
-    logger.info(f"Fitting normalizer on first {train_end_idx:,} samples (training data only)")
+    # FIXED: Use 85% split to match actual training split (not config.data.train_ratio = 0.70)
+    train_end_idx = int(len(df_15m) * 0.85)
+    logger.info(f"Fitting normalizer on first {train_end_idx:,} samples (85% = training data)")
+    
+    # Determine which columns to normalize (exclude RAW_COLUMNS)
+    normalize_cols = [c for c in feature_cols if c not in RAW_COLUMNS and c in df_15m.columns]
+    logger.info(f"Columns to normalize: {normalize_cols}")
+    logger.info(f"Columns kept RAW (for PnL/rewards): {[c for c in RAW_COLUMNS if c in df_15m.columns]}")
 
-    # Log pre-normalization statistics
+    # Log pre-normalization statistics for normalized columns
     logger.info("Pre-normalization feature ranges:")
-    for col in feature_cols[:6]:  # Show first 6
+    for col in normalize_cols[:6]:  # Show first 6
         if col in df_15m.columns:
             logger.info(f"  {col}: min={df_15m[col].min():.6f}, max={df_15m[col].max():.6f}")
 
-    # Normalize all timeframes using SEPARATE normalizers per timeframe
-    df_15m_norm, df_1h_norm, df_4h_norm, normalizers = normalize_multi_timeframe(
-        df_15m, df_1h, df_4h,
-        feature_cols,
-        train_end_idx=train_end_idx
-    )
+    # Create normalizers ONLY for the columns that should be normalized
+    from src.data.normalizer import FeatureNormalizer
+    
+    normalizer_15m = FeatureNormalizer(normalize_cols)
+    normalizer_1h = FeatureNormalizer(normalize_cols)
+    normalizer_4h = FeatureNormalizer(normalize_cols)
+    
+    # Calculate proportional train indices for higher timeframes
+    train_ratio = train_end_idx / len(df_15m)
+    train_end_1h = int(len(df_1h) * train_ratio)
+    train_end_4h = int(len(df_4h) * train_ratio)
+    
+    # Fit normalizers on TRAINING data only
+    normalizer_15m.fit(df_15m.iloc[:train_end_idx])
+    normalizer_1h.fit(df_1h.iloc[:train_end_1h])
+    normalizer_4h.fit(df_4h.iloc[:train_end_4h])
+    
+    # Transform - this only affects normalize_cols, RAW columns are untouched
+    df_15m_norm = normalizer_15m.transform(df_15m)
+    df_1h_norm = normalizer_1h.transform(df_1h)
+    df_4h_norm = normalizer_4h.transform(df_4h)
+    
+    normalizers = {'15m': normalizer_15m, '1h': normalizer_1h, '4h': normalizer_4h}
 
-    # Log post-normalization statistics for each timeframe
+    # Log post-normalization statistics
     logger.info("Post-normalization feature ranges (should be ~[-3, 3]):")
     for tf, df_norm in [('15m', df_15m_norm), ('1h', df_1h_norm), ('4h', df_4h_norm)]:
         logger.info(f"  {tf}:")
-        for col in feature_cols[:3]:  # First 3 features
+        for col in normalize_cols[:3]:  # First 3 normalized features
             if col in df_norm.columns:
                 logger.info(f"    {col}: min={df_norm[col].min():.3f}, max={df_norm[col].max():.3f}")
+    
+    # Verify RAW columns are unchanged
+    logger.info("RAW columns preserved (not normalized):")
+    for col in ['close', 'atr', 'chop']:
+        if col in df_15m.columns:
+            logger.info(f"  {col}: min={df_15m_norm[col].min():.6f}, max={df_15m_norm[col].max():.6f}")
 
     # Save normalizers for inference (one per timeframe)
     for tf, normalizer in normalizers.items():
@@ -217,19 +282,28 @@ def step_4_train_analyst(
 ) -> torch.nn.Module:
     """
     Step 4: Train the Market Analyst (supervised learning).
+    
+    FIXED: Uses only derived features for model input (not raw OHLC).
+    Raw close prices are still used for target calculation.
     """
     logger.info("=" * 60)
     logger.info("STEP 4: Training Market Analyst")
     logger.info("=" * 60)
 
-    # Feature columns for the model
-    feature_cols = ['open', 'high', 'low', 'close', 'atr',
-                   'pinbar', 'engulfing', 'doji', 'ema_trend',
-                   'regime', 'returns', 'volatility']
+    # Feature columns for model INPUT (exclude raw OHLC)
+    # FIXED: Model should learn from derived features, not absolute price levels
+    feature_cols = [
+        'returns', 'volatility',           # Price dynamics
+        'pinbar', 'engulfing', 'doji',     # Price action patterns
+        'ema_trend', 'ema_crossover',      # Trend indicators
+        'regime', 'sma_distance',          # Regime/trend filters
+        'dist_to_resistance', 'dist_to_support'  # S/R distance
+    ]
 
     # Filter to available columns
     feature_cols = [c for c in feature_cols if c in df_15m.columns]
-    logger.info(f"Using {len(feature_cols)} features: {feature_cols}")
+    logger.info(f"Using {len(feature_cols)} MODEL INPUT features: {feature_cols}")
+    logger.info(f"Note: Raw 'close' used for target, not as model input")
 
     save_path = str(config.paths.models_analyst)
 
@@ -406,10 +480,21 @@ def main():
     config.paths.ensure_dirs()
 
     try:
-        # Define feature columns used throughout the pipeline
-        feature_cols = ['open', 'high', 'low', 'close', 'atr',
-                       'pinbar', 'engulfing', 'doji', 'ema_trend',
-                       'regime', 'returns', 'volatility']
+        # Define feature columns for MODEL INPUT (not raw OHLC)
+        # FIXED: Exclude raw OHLC from model input - model should learn from
+        # derived features (returns, patterns) not absolute price levels.
+        # Raw OHLC is kept in DataFrame for PnL/target calculations.
+        model_feature_cols = [
+            'returns', 'volatility',           # Price dynamics (normalized)
+            'pinbar', 'engulfing', 'doji',     # Price action patterns
+            'ema_trend', 'ema_crossover',      # Trend indicators
+            'regime', 'sma_distance',          # Regime/trend filters
+            'dist_to_resistance', 'dist_to_support'  # S/R distance (new)
+        ]
+        
+        # All feature columns including raw values (for normalization step)
+        all_feature_cols = ['open', 'high', 'low', 'close', 'atr', 'chop', 'adx'] + model_feature_cols
+        feature_cols = model_feature_cols  # Use model features by default
 
         if args.backtest_only:
             # Load normalized processed data
@@ -430,10 +515,15 @@ def main():
 
             # Filter feature columns to available ones
             feature_cols = [c for c in feature_cols if c in df_15m.columns]
+            all_feature_cols = [c for c in all_feature_cols if c in df_15m.columns]
+            
+            logger.info(f"Model input features: {feature_cols}")
+            logger.info(f"All features (including raw): {all_feature_cols}")
 
             # Step 3b: NORMALIZE FEATURES (CRITICAL for neural network convergence)
+            # Pass all_feature_cols so normalization knows about raw columns to exclude
             df_15m, df_1h, df_4h, normalizer = step_3b_normalize_features(
-                df_15m, df_1h, df_4h, feature_cols, config
+                df_15m, df_1h, df_4h, all_feature_cols, config
             )
 
             # Step 4: Train Analyst (on NORMALIZED data)

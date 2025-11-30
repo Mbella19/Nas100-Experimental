@@ -516,17 +516,22 @@ def market_regime(
 
 def engineer_all_features(
     df: pd.DataFrame,
-    config: Optional[dict] = None
+    config: Optional[dict] = None,
+    include_sr_features: bool = True
 ) -> pd.DataFrame:
     """
     Apply all feature engineering to OHLCV DataFrame.
+    
+    IMPORTANT: Does NOT drop NaN rows - alignment is handled by the pipeline.
+    This preserves index alignment between timeframes.
 
     Args:
         df: OHLCV DataFrame
         config: Optional configuration dict
+        include_sr_features: Whether to include S/R distance features (slower)
 
     Returns:
-        DataFrame with all features added
+        DataFrame with all features added (may contain NaN at edges)
     """
     if config is None:
         config = {
@@ -563,16 +568,27 @@ def engineer_all_features(
     result['adx'] = adx(df, config['adx_period'])
     result['regime'] = market_regime(df, config['chop_period'], config['adx_period'])
 
+    # S/R Distance Features (market structure signals)
+    if include_sr_features:
+        logger.info("  Computing S/R distance features...")
+        dist_to_r, dist_to_s = distance_to_nearest_sr(
+            df['close'], df, result['atr'],
+            fractal_window=config['fractal_window'],
+            lookback=config['sr_lookback']
+        )
+        result['dist_to_resistance'] = dist_to_r.clip(-50, 50).astype(np.float32)
+        result['dist_to_support'] = dist_to_s.clip(-50, 50).astype(np.float32)
+
     # Returns (for normalization and targets)
     result['returns'] = df['close'].pct_change().astype(np.float32)
 
     # Volatility
     result['volatility'] = result['returns'].rolling(20).std().astype(np.float32)
 
-    # Drop NaN rows (from lookback calculations)
-    initial_len = len(result)
-    result = result.dropna()
-    logger.info(f"Features complete. Dropped {initial_len - len(result)} NaN rows. Final: {len(result):,} rows")
+    # DO NOT drop NaN rows - alignment is handled by the pipeline
+    # This preserves index alignment between timeframes
+    nan_count = result.isna().any(axis=1).sum()
+    logger.info(f"Features complete. {len(result):,} rows, {nan_count:,} rows with NaN (will be aligned in pipeline)")
 
     # Ensure all float32
     for col in result.columns:
