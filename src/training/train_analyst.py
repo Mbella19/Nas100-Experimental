@@ -162,7 +162,7 @@ class RankingMSELoss(nn.Module):
        At collapse (pred_i = pred_j), gradient = -1 (pushes pred_i UP, pred_j DOWN)
     """
     
-    def __init__(self, ranking_weight: float = 1.0):
+    def __init__(self, ranking_weight: float = 2.0):
         """
         Args:
             ranking_weight: Weight for ranking loss component
@@ -178,51 +178,41 @@ class RankingMSELoss(nn.Module):
         # 1. Raw MSE - learns magnitude
         mse_loss = nn.functional.mse_loss(predictions, targets)
         
-        # 2. RANKING LOSS - correct ordering
-        n_pairs = min(batch_size * 4, batch_size * (batch_size - 1) // 2)
+        # 2. RANKING LOSS - learns relative ordering
+        # Pairwise ranking loss
         ranking_loss = torch.tensor(0.0, device=predictions.device)
-        
-        if batch_size > 1 and n_pairs > 0:
-            idx1 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
-            idx2 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
+        if batch_size > 1:
+            # Sample random pairs (efficient implementation)
+            # Compare i with i+1 (cyclic)
+            idx1 = torch.arange(batch_size, device=predictions.device)
+            idx2 = (idx1 + 1) % batch_size
             
-            mask = idx1 != idx2
-            idx1, idx2 = idx1[mask], idx2[mask]
+            target_diff = targets[idx1] - targets[idx2]
+            pred_diff = predictions[idx1] - predictions[idx2]
             
-            if idx1.size(0) > 0:
-                target_diff = targets[idx1] - targets[idx2]
-                pred_diff = predictions[idx1] - predictions[idx2]
-                
-                # Soft hinge loss
-                temp = targets.std().detach() + 1e-6
-                signs = torch.sign(target_diff)
-                margin_violations = -signs * pred_diff / temp
-                ranking_loss = torch.nn.functional.softplus(margin_violations).mean()
+            # Only penalize if signs don't match direction
+            # If target_diff > 0, we want pred_diff > 0
+            # Loss = ReLU(-sign(target_diff) * pred_diff)
+            signs = torch.sign(target_diff)
+            # Ignore small differences to reduce noise
+            mask = (torch.abs(target_diff) > 0.0001).float()
+            
+            ranking_loss = (torch.nn.functional.relu(-signs * pred_diff) * mask).mean()
         
-        # 3. SIGN LOSS (Fixed: Prevent saturation)
-        # Use sigmoid to approximate step function
-        # Scale=10.0 keeps 0.1 in linear range of sigmoid
-        # Scale=100.0 saturated gradients for preds > 0.05
-        pred_soft_sign = torch.sigmoid(predictions * 10.0)
-        pred_pos_frac = pred_soft_sign.mean()
-        target_pos_frac = (targets > 0).float().mean()
-        sign_loss = (pred_pos_frac - target_pos_frac) ** 2
-        
-        # 4. VARIANCE LOSS - Force scale matching
+        # 3. VARIANCE LOSS - Force scale matching (Robust)
         pred_std = predictions.std() + 1e-6
         target_std = targets.std().detach() + 1e-6
         variance_loss = (pred_std - target_std) ** 2
 
-        # 5. MEAN LOSS - Force centering (Anti-bias)
+        # 4. MEAN LOSS - Force centering (Anti-bias)
         pred_mean = predictions.mean()
         target_mean = targets.mean().detach()
         mean_loss = (pred_mean - target_mean) ** 2
         
         # Combined loss
-        # heavily weight auxiliary losses to break collapse
+        # Variance and Mean losses are critical for avoiding collapse
         total_loss = mse_loss + \
                      self.ranking_weight * ranking_loss + \
-                     10.0 * sign_loss + \
                      10.0 * variance_loss + \
                      10.0 * mean_loss
         
@@ -305,10 +295,10 @@ class AnalystTrainer:
         )
 
         # Loss function: RankingMSELoss - FORCED VARIANCE + RANKING
-        # FIX 1: Soft Sign Loss (Differentiable, non-saturating)
-        # FIX 2: Variance Loss ((pred_std - target_std)^2) forces scale
-        # FIX 3: Mean Loss forces centering (breaks positive bias)
-        self.criterion = RankingMSELoss(ranking_weight=1.0)
+        # FIX 1: Variance Loss ((pred_std - target_std)^2) forces scale
+        # FIX 2: Mean Loss forces centering (breaks positive/negative bias)
+        # FIX 3: Ranking loss ensures correct relative ordering
+        self.criterion = RankingMSELoss(ranking_weight=2.0)
 
         # Training history
         self.train_losses = []
