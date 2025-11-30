@@ -43,12 +43,14 @@ data/processed/*.parquet
 *.csv
 *.parquet
 
-# Model checkpoints (too large for git)
+# Model checkpoints and serialized objects (too large for git)
 models/analyst/*.pt
+models/analyst/*.pkl
 models/agent/*.zip
 *.pt
 *.pth
 *.zip
+*.pkl
 
 # Results
 results/
