@@ -137,84 +137,72 @@ class MultiTimeframeDataset(Dataset):
         )
 
 
-class ContrastiveLoss(nn.Module):
+class StandardizedMSELoss(nn.Module):
     """
-    Loss function that prevents mode collapse using CONTRASTIVE REGRESSION.
+    Loss function that GUARANTEES gradient signal at mode collapse.
     
-    KEY INSIGHT: Both variance penalty AND absolute value have zero gradient at collapse!
-    - d(Var)/d(pred_i) = 0 when all pred_i = mean
-    - d|x|/dx = sign(x) = undefined at x=0
+    ROOT CAUSE OF ALL PREVIOUS FAILURES:
+    - Variance penalty: d(Var)/d(pred_i) = 0 at collapse
+    - Absolute diff: d|x|/dx = undefined at x=0  
+    - Squared diff: d(x²)/dx = 2x = 0 at x=0
     
-    SOLUTION: Use SQUARED differences which ALWAYS have gradient:
-    d(x^2)/dx = 2x (non-zero everywhere except exactly at x=0, but gradient points toward 0)
+    ALL pairwise/variance losses have ZERO gradient when predictions are identical!
     
-    CRITICAL FIX: We need gradient that points AWAY from constant predictions.
+    SOLUTION: STANDARDIZE predictions before MSE.
     
-    Loss = MSE + contrastive_weight * contrastive_loss
+    pred_std = (pred - pred.mean()) / (pred.std() + eps) * target.std() + target.mean()
+    loss = MSE(pred_std, target)
     
-    contrastive_loss: For each pair, predictions should differ proportionally to targets:
-    loss = mean((target_diff - pred_diff)^2)
+    WHY THIS WORKS:
+    When pred.std() → 0, the scaling factor target.std()/(pred.std() + eps) → HUGE
+    This AMPLIFIES any tiny deviation from constant, creating massive gradient.
     
-    This has gradient even when pred_diff = 0:
-    d(loss)/d(pred_i) = -2 * (target_diff - pred_diff) * d(pred_diff)/d(pred_i)
-                      = -2 * target_diff * 2 * (pred_i - pred_j) / (2*|pred_i - pred_j| + eps)
-    
-    At pred_i = pred_j:
-    d(loss)/d(pred_i) ≈ -2 * target_diff * sign(any perturbation) → pushes apart!
+    The gradient does NOT go to zero at collapse - it goes to INFINITY!
+    This is the opposite behavior of all previous losses.
     """
     
-    def __init__(self, mse_weight: float = 1.0, contrastive_weight: float = 1.0):
+    def __init__(self, standardize_weight: float = 0.5):
         """
         Args:
-            mse_weight: Weight for MSE loss (main learning signal)
-            contrastive_weight: Weight for contrastive loss (anti-collapse)
+            standardize_weight: Blend between raw MSE (0) and standardized MSE (1)
+                               0.5 = equal blend, which balances learning mean vs variance
         """
         super().__init__()
-        self.mse_weight = mse_weight
-        self.contrastive_weight = contrastive_weight
+        self.standardize_weight = standardize_weight
         
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         predictions = predictions.squeeze()
         targets = targets.squeeze()
         
-        # 1. MSE loss for magnitude accuracy
-        mse_loss = nn.functional.mse_loss(predictions, targets)
+        # 1. Raw MSE - learns to predict correct mean
+        raw_mse = nn.functional.mse_loss(predictions, targets)
         
-        # 2. Contrastive loss - SQUARED DIFFERENCES HAVE GRADIENT!
-        batch_size = predictions.size(0)
-        n_pairs = min(batch_size * 4, batch_size * (batch_size - 1) // 2)
+        # 2. Standardized MSE - forces correct variance
+        pred_mean = predictions.mean()
+        pred_std = predictions.std()
+        target_mean = targets.mean()
+        target_std = targets.std()
         
-        if batch_size > 1 and n_pairs > 0:
-            # Generate random pair indices
-            idx1 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
-            idx2 = torch.randint(0, batch_size, (n_pairs,), device=predictions.device)
-            
-            # Ensure pairs are different
-            mask = idx1 != idx2
-            idx1 = idx1[mask]
-            idx2 = idx2[mask]
-            
-            if idx1.size(0) > 0:
-                # SQUARED differences - ALWAYS has gradient!
-                target_diffs_sq = (targets[idx1] - targets[idx2]) ** 2
-                pred_diffs_sq = (predictions[idx1] - predictions[idx2]) ** 2
-                
-                # Scale target diffs to [0, 1] range for stability
-                target_scale = target_diffs_sq.mean().detach() + 1e-8
-                target_diffs_normalized = target_diffs_sq / target_scale
-                pred_diffs_normalized = pred_diffs_sq / target_scale
-                
-                # Contrastive: pred differences should MATCH target differences
-                # When pred_diff=0 but target_diff>0, gradient pushes predictions apart
-                # d((t-p)^2)/d(p) = -2*(t-p) = -2*t when p=0, which is NON-ZERO!
-                contrastive_loss = nn.functional.mse_loss(pred_diffs_normalized, target_diffs_normalized)
-            else:
-                contrastive_loss = torch.tensor(0.0, device=predictions.device)
-        else:
-            contrastive_loss = torch.tensor(0.0, device=predictions.device)
+        # Standardize predictions to match target distribution
+        # Add small epsilon to avoid division by zero, but keep it small
+        # so that when std is tiny, the scaling is HUGE (strong gradient)
+        eps = 1e-6
+        
+        # Center and scale predictions to match target statistics
+        pred_centered = predictions - pred_mean
+        pred_standardized = pred_centered / (pred_std + eps) * target_std + target_mean
+        
+        standardized_mse = nn.functional.mse_loss(pred_standardized, targets)
+        
+        # 3. Direct variance matching penalty (backup gradient signal)
+        # Log ratio has gradient even at small values
+        variance_ratio = (pred_std + eps) / (target_std + eps)
+        variance_penalty = (torch.log(variance_ratio)) ** 2
         
         # Combined loss
-        total_loss = self.mse_weight * mse_loss + self.contrastive_weight * contrastive_loss
+        total_loss = (1 - self.standardize_weight) * raw_mse + \
+                     self.standardize_weight * standardized_mse + \
+                     0.1 * variance_penalty
         
         return total_loss
 
@@ -294,10 +282,11 @@ class AnalystTrainer:
             patience=5
         )
 
-        # Loss function: ContrastiveLoss = MSE + Contrastive
-        # KEY FIX: Uses SQUARED differences which ALWAYS have gradient
-        # d(x^2)/dx = 2x ≠ 0, unlike d|x|/dx = sign(x) = undefined at 0
-        self.criterion = ContrastiveLoss(mse_weight=1.0, contrastive_weight=1.0)
+        # Loss function: StandardizedMSELoss - GUARANTEED gradient at collapse
+        # KEY FIX: Standardizes predictions before MSE
+        # When pred.std() → 0, gradient → INFINITY (not zero!)
+        # This is the opposite of variance penalty which has gradient → 0
+        self.criterion = StandardizedMSELoss(standardize_weight=0.5)
 
         # Training history
         self.train_losses = []
