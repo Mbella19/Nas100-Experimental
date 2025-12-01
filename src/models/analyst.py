@@ -323,17 +323,20 @@ def load_analyst(
     checkpoint = torch.load(path, map_location=device or 'cpu')
 
     # Create model
+    # Create model
     if 'config' in checkpoint:
-        config = checkpoint['config']
+        saved_config = checkpoint['config']
+        from config.settings import config as global_config
+        
         model = MarketAnalyst(
             feature_dims=feature_dims,
-            d_model=config.get('d_model', 64),
-            nhead=config.get('nhead', 4),
-            num_layers=config.get('num_layers', 2),
-            dim_feedforward=config.get('dim_feedforward', 128),
-            context_dim=config.get('context_dim', 64),
-            dropout=config.get('dropout', 0.1),
-            num_classes=config.get('num_classes', 5)
+            d_model=saved_config.get('d_model', global_config.analyst.d_model),
+            nhead=saved_config.get('nhead', global_config.analyst.nhead),
+            num_layers=saved_config.get('num_layers', global_config.analyst.num_layers),
+            dim_feedforward=saved_config.get('dim_feedforward', global_config.analyst.dim_feedforward),
+            context_dim=saved_config.get('context_dim', global_config.analyst.context_dim),
+            dropout=saved_config.get('dropout', global_config.analyst.dropout),
+            num_classes=saved_config.get('num_classes', global_config.analyst.num_classes)
         )
     else:
         model = create_analyst(feature_dims)

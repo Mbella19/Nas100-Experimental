@@ -914,19 +914,22 @@ class AnalystTrainer:
             'val_direction_accs': self.val_direction_accs,
             'best_val_loss': self.best_val_loss,
             'config': {
-                'd_model': self.model.d_model,
-                'context_dim': self.model.context_dim,
-                'num_classes': self.model.num_classes,
-                'up_classes': self.up_classes,
-                'down_classes': self.down_classes,
-                'class_names': self.class_names,
-                'class_meta': self.class_meta
-            }
+            'd_model': self.model.d_model,
+            'nhead': self.model.nhead,
+            'num_layers': self.model.num_layers,
+            'dim_feedforward': self.model.dim_feedforward,
+            'dropout': self.model.dropout,
+            'context_dim': self.model.context_dim,
+            'num_classes': self.model.num_classes,
+            'up_classes': self.up_classes,
+            'down_classes': self.down_classes,
+            'class_names': self.class_names,
         }
+    }
 
-        filename = 'best.pt' if is_best else f'epoch_{epoch}.pt'
-        torch.save(checkpoint, path / filename)
-        logger.info(f"Saved checkpoint to {path / filename}")
+    filename = 'best.pt' if is_best else f'epoch_{epoch}.pt'
+    torch.save(checkpoint, path / filename)
+    logger.info(f"Saved checkpoint to {path / filename}")
 
 
 def train_analyst(
