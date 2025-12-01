@@ -99,66 +99,55 @@ class DataConfig:
 @dataclass
 class AnalystConfig:
     """Market Analyst (Transformer) configuration."""
+    d_model: int = 32           # Reduced from 64
+    nhead: int = 2              # Reduced from 4
+    num_layers: int = 1         # Reduced from 2
+    dim_feedforward: int = 64   # Reduced from 128
+    dropout: float = 0.4        # INCREASED to stop overfitting
+    context_dim: int = 64       
 
-    # Architecture (memory-optimized for M2)
-    d_model: int = 64           # Model dimension
-    nhead: int = 4              # Attention heads
-    num_layers: int = 2         # Transformer layers
-    dim_feedforward: int = 128  # FFN dimension
-    dropout: float = 0.1
-    context_dim: int = 64       # Output context vector dimension
-
-    # Training
-    batch_size: int = 64        # Increased from 32 to reduce gradient noise
-    learning_rate: float = 1e-3  # Increased from 1e-4 to escape mode collapse
-    weight_decay: float = 1e-5
+    batch_size: int = 64
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-2  # INCREASED to stop overfitting
     max_epochs: int = 100
-    patience: int = 10          # Early stopping patience
+    patience: int = 15          
 
-    # Memory management
-    cache_clear_interval: int = 50  # Clear cache every N batches
-
-    # Target computation
-    future_window: int = 24     # Changed from 12: 6-hour lookahead for stronger signal
-    smooth_window: int = 24     # Changed from 12: match future_window for consistency
-    num_classes: int = 3        # Simplified: Down/Neutral/Up (was 5)
-    # Wider neutral zone to reduce class imbalance and improve Up recall
-    # Changed from ±0.25σ to ±0.5σ for better class balance
-    class_std_thresholds: Tuple[float, float] = (-0.5, 0.5)
+    cache_clear_interval: int = 50
+    future_window: int = 48     # 12 Hours (Smoother Target)
+    smooth_window: int = 48     
+    num_classes: int = 3        
+    class_std_thresholds: Tuple[float, float] = (-0.75, 0.75) # Widen to filter noise
 
 
 @dataclass
 class TradingConfig:
     """Trading environment configuration."""
-
-    # Transaction costs (in pips)
     spread_pips: float = 1.5
-
-    # Position sizing (multipliers)
-    position_sizes: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
-
-    # Reward shaping
-    # NOTE: Penalties are now small regularizers, not dominant signals.
-    # With reward_scaling=0.1, a 10-pip trade becomes 1.0 reward.
-    # Penalties are now ~2 pip and ~1 pip equivalents to avoid discouraging trading.
-    fomo_penalty: float = -0.2      # Reduced from -2.0 (was 20 pip equivalent, now 2 pip)
-    chop_penalty: float = -0.1      # Reduced from -1.0 (was 10 pip equivalent, now 1 pip)
-    fomo_threshold_atr: float = 2.0 # ATR multiplier for FOMO detection
-    chop_threshold: float = 60.0    # Choppiness index threshold
-    reward_scaling: float = 0.1     # Scale PnL to balance with penalties
-
-    # Risk Management - Stop-Loss and Take-Profit (in pips)
-    # Stop-loss: Automatically close losing positions at this threshold
-    # Based on analysis: avg_loser was -6.87 pips vs avg_winner +5.32 pips
-    # A 15-pip stop allows for normal volatility while cutting catastrophic losses
-    stop_loss_pips: float = 15.0    # Close position if loss exceeds this (in pips)
-    take_profit_pips: float = 25.0  # Close position if profit exceeds this (in pips)
-    use_stop_loss: bool = True      # Enable/disable stop-loss mechanism
-    use_take_profit: bool = True    # Enable/disable take-profit mechanism
-
+    
+    # NEW: Risk-Based Sizing (Not Fixed Lots)
+    risk_multipliers: Tuple[float, ...] = (0.5, 1.0, 1.5, 2.0)
+    
+    # NEW: ATR-Based Stops (Not Fixed Pips)
+    sl_atr_multiplier: float = 1.5
+    tp_atr_multiplier: float = 3.0
+    
+    # Risk Limits
+    max_position_size: float = 5.0
+    
+    # Reward Params
+    fomo_penalty: float = -0.2
+    chop_penalty: float = -0.1
+    fomo_threshold_atr: float = 2.0
+    chop_threshold: float = 60.0
+    reward_scaling: float = 0.1
+    
+    # These are mostly unused now but keep for compatibility if needed
+    use_stop_loss: bool = True
+    use_take_profit: bool = True
+    
     # Environment settings
     max_steps_per_episode: int = 2000
-    initial_balance: float = 10000.0  # Not used for now, but can be extended
+    initial_balance: float = 10000.0
 
 
 @dataclass

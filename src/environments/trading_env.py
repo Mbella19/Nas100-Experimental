@@ -414,56 +414,79 @@ class TradingEnv(gym.Env):
         # ATR is in price units (e.g. 0.0020), pip_value is 0.0001
         sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
         tp_pips = (atr * self.tp_atr_multiplier) / 0.0001
+    def _check_stop_loss_take_profit(self, price: float, time: pd.Timestamp) -> Tuple[float, str]:
+        """
+        Check if stop-loss or take-profit is hit.
         
-        # Ensure minimum values (e.g. 5 pips) to prevent instant stop-outs in low vol
-        sl_pips = max(sl_pips, 5.0)
-        tp_pips = max(tp_pips, 5.0)
+        Uses ATR-based dynamic thresholds.
+        """
+        if self.position == 0:
+            return 0.0, ''
+
+        # Calculate PnL in pips
+        raw_pips = self._calculate_pnl_pips(price)
+        
+        # Get ATR for dynamic thresholds
+        atr = 0.0010 # Default fallback
+        if len(self.market_features.shape) > 1:
+            atr = self.market_features[self.current_idx, 0]
+            
+        # Calculate dynamic thresholds
+        # SL = 1.5 * ATR
+        # TP = 3.0 * ATR
+        sl_pips_threshold = (atr * self.sl_atr_multiplier) / 0.0001
+        tp_pips_threshold = (atr * self.tp_atr_multiplier) / 0.0001
+        
+        # Enforce minimums (e.g. 5 pips) to prevent noise stop-outs
+        sl_pips_threshold = max(sl_pips_threshold, 5.0)
+        tp_pips_threshold = max(tp_pips_threshold, 5.0)
 
         # Check stop-loss (loss exceeds threshold)
-        if self.use_stop_loss and raw_pips < -sl_pips:
-            triggered = True
-            trigger_reason = 'stop_loss'
-            info['stop_loss_triggered'] = True
-
-        # Check take-profit (profit exceeds threshold)
-        elif self.use_take_profit and raw_pips > tp_pips:
-            triggered = True
-            trigger_reason = 'take_profit'
-            info['take_profit_triggered'] = True
-
-        if triggered:
-            # Calculate final PnL delta for reward
-            final_delta = unrealized_pnl - self.prev_unrealized_pnl
-            reward += final_delta * self.reward_scaling
-
-            # Add direction bonus for take-profit (profitable exit)
-            if trigger_reason == 'take_profit' and unrealized_pnl > 0:
-                reward += 5.0 * self.position_size * self.reward_scaling
-                info['direction_bonus'] = True
-
-            # Record the trade
-            info['trade_closed'] = True
-            info['pnl'] = unrealized_pnl
-            info['pnl_delta'] = final_delta
-            info['close_reason'] = trigger_reason
-
-            self.total_pnl += unrealized_pnl
+        if self.use_stop_loss and raw_pips < -sl_pips_threshold:
+            # Calculate realized PnL
+            pnl = self._calculate_unrealized_pnl(price)
+            
+            # Close position
+            self.total_pnl += pnl
             self.trades.append({
                 'entry': self.entry_price,
-                'exit': current_price,
+                'exit': price,
                 'direction': self.position,
                 'size': self.position_size,
-                'pnl': unrealized_pnl,
-                'close_reason': trigger_reason
+                'pnl': pnl,
+                'close_reason': 'stop_loss'
             })
-
-            # Reset position state
+            
+            # Reset
             self.position = 0
             self.position_size = 0.0
             self.entry_price = 0.0
             self.prev_unrealized_pnl = 0.0
+            
+            return pnl, 'stop_loss'
 
-        return reward, info
+        # Check take-profit (profit exceeds threshold)
+        if self.use_take_profit and raw_pips > tp_pips_threshold:
+            pnl = self._calculate_unrealized_pnl(price)
+            
+            self.total_pnl += pnl
+            self.trades.append({
+                'entry': self.entry_price,
+                'exit': price,
+                'direction': self.position,
+                'size': self.position_size,
+                'pnl': pnl,
+                'close_reason': 'take_profit'
+            })
+            
+            self.position = 0
+            self.position_size = 0.0
+            self.entry_price = 0.0
+            self.prev_unrealized_pnl = 0.0
+            
+            return pnl, 'take_profit'
+
+        return 0.0, ''
 
     def _execute_action(self, action: np.ndarray) -> Tuple[float, dict]:
         """
