@@ -109,7 +109,7 @@ class AnalystConfig:
     context_dim: int = 64       # Output context vector dimension
 
     # Training
-    batch_size: int = 32        # Conservative for M2
+    batch_size: int = 64        # Increased from 32 to reduce gradient noise
     learning_rate: float = 1e-3  # Increased from 1e-4 to escape mode collapse
     weight_decay: float = 1e-5
     max_epochs: int = 100
@@ -121,8 +121,9 @@ class AnalystConfig:
     # Target computation
     future_window: int = 12     # Candles ahead for smoothed return
     smooth_window: int = 12     # Rolling window for smoothing
-    num_classes: int = 5        # Number of discrete return classes
-    class_std_thresholds: Tuple[float, float, float, float] = (-0.5, -0.1, 0.1, 0.5)
+    num_classes: int = 3        # Simplified: Down/Neutral/Up (was 5)
+    # Wider neutral zone to filter noise - anything between -0.25σ and +0.25σ is Neutral
+    class_std_thresholds: Tuple[float, float] = (-0.25, 0.25)
 
 
 @dataclass

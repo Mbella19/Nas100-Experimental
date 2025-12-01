@@ -400,13 +400,10 @@ class AnalystTrainer:
         self.down_classes = down_classes
         self.class_meta = class_meta or {}
 
-        default_class_names = [
-            "Strong Down",
-            "Weak Down",
-            "Neutral",
-            "Weak Up",
-            "Strong Up"
-        ]
+        # Support both 3-class and 5-class schemes
+        default_class_names_3 = ["Down", "Neutral", "Up"]
+        default_class_names_5 = ["Strong Down", "Weak Down", "Neutral", "Weak Up", "Strong Up"]
+        default_class_names = default_class_names_3 if num_classes == 3 else default_class_names_5
         self.class_names = class_names or default_class_names[:num_classes]
         if len(self.class_names) < num_classes:
             missing = [f"Class {i}" for i in range(len(self.class_names), num_classes)]
@@ -947,7 +944,13 @@ def train_analyst(
     Returns:
         Tuple of (trained model, training history)
     """
-    class_names = [
+    # Class names depend on num_classes from config
+    class_names_3 = [
+        "Down (< -0.25σ)",
+        "Neutral (-0.25σ to +0.25σ)",
+        "Up (> +0.25σ)"
+    ]
+    class_names_5 = [
         "Strong Down (<-0.5σ)",
         "Weak Down (-0.5σ to -0.1σ)",
         "Neutral (-0.1σ to +0.1σ)",
@@ -960,8 +963,8 @@ def train_analyst(
         from config.settings import Config
         config = Config().analyst
 
-    num_classes = config.num_classes if hasattr(config, 'num_classes') else len(class_names)
-    class_names = class_names[:num_classes]
+    num_classes = config.num_classes if hasattr(config, 'num_classes') else 5
+    class_names = class_names_3 if num_classes == 3 else class_names_5
     if len(class_names) < num_classes:
         class_names += [f"Class {i}" for i in range(len(class_names), num_classes)]
 
@@ -998,10 +1001,15 @@ def train_analyst(
     total_labels = label_counts.sum() if label_counts.sum() > 0 else 1
 
     logger.info("Class boundaries (scaled returns):")
-    logger.info(f"  Strong Down (<): {class_meta['strong_down_threshold']:.6f}")
-    logger.info(f"  Weak Down  (<): {class_meta['weak_down_threshold']:.6f}")
-    logger.info(f"  Neutral    (<=): {class_meta['weak_up_threshold']:.6f}")
-    logger.info(f"  Strong Up  (>): {class_meta['strong_up_threshold']:.6f}")
+    if num_classes == 3:
+        logger.info(f"  Down     (<): {class_meta.get('down_threshold', class_meta['strong_down_threshold']):.6f}")
+        logger.info(f"  Neutral  (<=): {class_meta.get('up_threshold', class_meta['strong_up_threshold']):.6f}")
+        logger.info(f"  Up       (>): {class_meta.get('up_threshold', class_meta['strong_up_threshold']):.6f}")
+    else:
+        logger.info(f"  Strong Down (<): {class_meta['strong_down_threshold']:.6f}")
+        logger.info(f"  Weak Down  (<): {class_meta['weak_down_threshold']:.6f}")
+        logger.info(f"  Neutral    (<=): {class_meta['weak_up_threshold']:.6f}")
+        logger.info(f"  Strong Up  (>): {class_meta['strong_up_threshold']:.6f}")
     logger.info("Class distribution (overall):")
     for idx, count in label_counts.items():
         name = class_names[int(idx)] if int(idx) < len(class_names) else f"Class {int(idx)}"
@@ -1098,8 +1106,8 @@ def train_analyst(
         visualize=visualize,
         num_classes=num_classes,
         class_weights=class_weights,
-        up_classes=(3, 4),
-        down_classes=(0, 1),
+        up_classes=(2,) if num_classes == 3 else (3, 4),
+        down_classes=(0,) if num_classes == 3 else (0, 1),
         class_names=class_names,
         class_meta=class_meta
     )

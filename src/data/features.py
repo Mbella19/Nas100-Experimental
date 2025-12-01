@@ -641,56 +641,96 @@ def create_smoothed_target(
 
 def create_return_classes(
     target: pd.Series,
-    class_std_thresholds: Tuple[float, float, float, float] = (-0.5, -0.1, 0.1, 0.5)
+    class_std_thresholds: Tuple = (-0.25, 0.25)
 ) -> Tuple[pd.Series, Dict[str, float]]:
     """
     Convert a continuous smoothed-return target into discrete classes.
 
-    Classes (5-class scheme):
-        0: Strong Down   (< -0.5 * std)
-        1: Weak Down     [-0.5 * std, -0.1 * std)
-        2: Neutral       [-0.1 * std, +0.1 * std]
-        3: Weak Up       (+0.1 * std, +0.5 * std]
-        4: Strong Up     (> +0.5 * std)
+    Supports both 3-class and 5-class schemes based on threshold count:
+
+    3-class scheme (2 thresholds: down_thresh, up_thresh):
+        0: Down      (< down_thresh * std)
+        1: Neutral   [down_thresh * std, up_thresh * std]
+        2: Up        (> up_thresh * std)
+
+    5-class scheme (4 thresholds: strong_down, weak_down, weak_up, strong_up):
+        0: Strong Down   (< strong_down * std)
+        1: Weak Down     [strong_down * std, weak_down * std)
+        2: Neutral       [weak_down * std, weak_up * std]
+        3: Weak Up       (weak_up * std, strong_up * std]
+        4: Strong Up     (> strong_up * std)
 
     Args:
         target: Smoothed return series (already scaled)
         class_std_thresholds: Multipliers of target std that define boundaries
+                             2 values for 3-class, 4 values for 5-class
 
     Returns:
         Tuple of (class labels Series with NaNs preserved, metadata dict)
     """
     target_std = float(target.dropna().std())
+    num_thresholds = len(class_std_thresholds)
 
-    boundaries = {
-        'strong_down': class_std_thresholds[0] * target_std,
-        'weak_down': class_std_thresholds[1] * target_std,
-        'weak_up': class_std_thresholds[2] * target_std,
-        'strong_up': class_std_thresholds[3] * target_std
-    }
+    if num_thresholds == 2:
+        # 3-class scheme: Down / Neutral / Up
+        down_thresh = class_std_thresholds[0] * target_std
+        up_thresh = class_std_thresholds[1] * target_std
 
-    def _assign_class(value: float) -> float:
-        if pd.isna(value):
-            return np.nan
-        if value < boundaries['strong_down']:
-            return 0
-        if value < boundaries['weak_down']:
-            return 1
-        if value <= boundaries['weak_up']:
-            return 2
-        if value <= boundaries['strong_up']:
-            return 3
-        return 4
+        def _assign_class(value: float) -> float:
+            if pd.isna(value):
+                return np.nan
+            if value < down_thresh:
+                return 0  # Down
+            if value <= up_thresh:
+                return 1  # Neutral
+            return 2  # Up
+
+        meta = {
+            'target_std': target_std,
+            'num_classes': 3,
+            'down_threshold': down_thresh,
+            'up_threshold': up_thresh,
+            # Legacy keys for compatibility
+            'strong_down_threshold': down_thresh,
+            'weak_down_threshold': down_thresh,
+            'weak_up_threshold': up_thresh,
+            'strong_up_threshold': up_thresh
+        }
+
+    elif num_thresholds == 4:
+        # 5-class scheme: Strong Down / Weak Down / Neutral / Weak Up / Strong Up
+        boundaries = {
+            'strong_down': class_std_thresholds[0] * target_std,
+            'weak_down': class_std_thresholds[1] * target_std,
+            'weak_up': class_std_thresholds[2] * target_std,
+            'strong_up': class_std_thresholds[3] * target_std
+        }
+
+        def _assign_class(value: float) -> float:
+            if pd.isna(value):
+                return np.nan
+            if value < boundaries['strong_down']:
+                return 0
+            if value < boundaries['weak_down']:
+                return 1
+            if value <= boundaries['weak_up']:
+                return 2
+            if value <= boundaries['strong_up']:
+                return 3
+            return 4
+
+        meta = {
+            'target_std': target_std,
+            'num_classes': 5,
+            'strong_down_threshold': boundaries['strong_down'],
+            'weak_down_threshold': boundaries['weak_down'],
+            'weak_up_threshold': boundaries['weak_up'],
+            'strong_up_threshold': boundaries['strong_up']
+        }
+    else:
+        raise ValueError(f"class_std_thresholds must have 2 or 4 values, got {num_thresholds}")
 
     labels = target.apply(_assign_class).astype(np.float32)
-
-    meta = {
-        'target_std': target_std,
-        'strong_down_threshold': boundaries['strong_down'],
-        'weak_down_threshold': boundaries['weak_down'],
-        'weak_up_threshold': boundaries['weak_up'],
-        'strong_up_threshold': boundaries['strong_up']
-    }
 
     return labels, meta
 
