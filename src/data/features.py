@@ -668,6 +668,15 @@ def engineer_all_features(
         result['dist_to_resistance'] = dist_to_r.clip(-50, 50).astype(np.float32)
         result['dist_to_support'] = dist_to_s.clip(-50, 50).astype(np.float32)
 
+    # Market Sessions
+    result = add_market_sessions(result)
+
+    # Structure Features (BOS/CHoCH)
+    f_high, f_low = detect_fractals(df, n=config['fractal_window'])
+    struct_df = detect_structure_breaks(df, f_high, f_low, n=config['fractal_window'])
+    for col in struct_df.columns:
+        result[col] = struct_df[col]
+
     # Returns (for normalization and targets)
     result['returns'] = df['close'].pct_change().astype(np.float32)
 
