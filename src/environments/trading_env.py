@@ -972,8 +972,8 @@ def create_env_from_dataframes(
     # Close prices for PnL
     close_prices = df_15m['close'].values[start_idx:start_idx + n_samples].astype(np.float32)
 
-    # Market features for reward shaping
-    market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance']
+    # Market features for reward shaping (includes S/R for breakout vs chase detection)
+    market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance', 'dist_to_support', 'dist_to_resistance']
     available_cols = [c for c in market_cols if c in df_15m.columns]
     market_features = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
 

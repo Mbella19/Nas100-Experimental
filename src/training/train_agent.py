@@ -406,8 +406,8 @@ def prepare_env_data(
     # Close prices
     close_prices = df_15m['close'].values[start_idx:start_idx + n_samples].astype(np.float32)
 
-    # Market features for reward shaping
-    market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance']
+    # Market features for reward shaping (includes S/R for breakout vs chase detection)
+    market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance', 'dist_to_support', 'dist_to_resistance']
     available_cols = [c for c in market_cols if c in df_15m.columns]
 
     if len(available_cols) > 0:
@@ -478,25 +478,27 @@ def create_trading_env(
     enforce_analyst_alignment = True
 
     if config is not None:
-        spread_pips = getattr(config, 'spread_pips', spread_pips)
-        slippage_pips = getattr(config, 'slippage_pips', slippage_pips)
-        fomo_penalty = getattr(config, 'fomo_penalty', fomo_penalty)
-        chop_penalty = getattr(config, 'chop_penalty', chop_penalty)
-        fomo_threshold_atr = getattr(config, 'fomo_threshold_atr', fomo_threshold_atr)
-        chop_threshold = getattr(config, 'chop_threshold', chop_threshold)
-        max_steps = getattr(config, 'max_steps_per_episode', max_steps)
-        reward_scaling = getattr(config, 'reward_scaling', reward_scaling)
+        # FIX: Access config.trading for trading parameters (not config directly)
+        trading_cfg = getattr(config, 'trading', config)
+        spread_pips = getattr(trading_cfg, 'spread_pips', spread_pips)
+        slippage_pips = getattr(trading_cfg, 'slippage_pips', slippage_pips)
+        fomo_penalty = getattr(trading_cfg, 'fomo_penalty', fomo_penalty)
+        chop_penalty = getattr(trading_cfg, 'chop_penalty', chop_penalty)
+        fomo_threshold_atr = getattr(trading_cfg, 'fomo_threshold_atr', fomo_threshold_atr)
+        chop_threshold = getattr(trading_cfg, 'chop_threshold', chop_threshold)
+        max_steps = getattr(trading_cfg, 'max_steps_per_episode', max_steps)
+        reward_scaling = getattr(trading_cfg, 'reward_scaling', reward_scaling)
         # Risk Management
-        sl_atr_multiplier = getattr(config, 'sl_atr_multiplier', sl_atr_multiplier)
-        tp_atr_multiplier = getattr(config, 'tp_atr_multiplier', tp_atr_multiplier)
-        use_stop_loss = getattr(config, 'use_stop_loss', use_stop_loss)
-        use_stop_loss = getattr(config, 'use_stop_loss', use_stop_loss)
-        use_take_profit = getattr(config, 'use_take_profit', use_take_profit)
-        # Volatility Sizing
-        volatility_sizing = getattr(config, 'volatility_sizing', volatility_sizing)
-        risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
+        sl_atr_multiplier = getattr(trading_cfg, 'sl_atr_multiplier', sl_atr_multiplier)
+        tp_atr_multiplier = getattr(trading_cfg, 'tp_atr_multiplier', tp_atr_multiplier)
+        use_stop_loss = getattr(trading_cfg, 'use_stop_loss', use_stop_loss)
+        use_take_profit = getattr(trading_cfg, 'use_take_profit', use_take_profit)
         # Analyst Alignment
-        enforce_analyst_alignment = getattr(config, 'enforce_analyst_alignment', enforce_analyst_alignment)
+        enforce_analyst_alignment = getattr(trading_cfg, 'enforce_analyst_alignment', enforce_analyst_alignment)
+
+        # Log config values to verify they're applied
+        logger.info(f"Config applied: fomo_penalty={fomo_penalty}, reward_scaling={reward_scaling}, "
+                    f"slippage_pips={slippage_pips}, enforce_analyst_alignment={enforce_analyst_alignment}")
 
     if analyst_model is not None:
         context_dim = analyst_model.context_dim
