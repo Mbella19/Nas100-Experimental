@@ -179,17 +179,26 @@ class MultiTimeframeDataset(Dataset):
         """
         actual_idx = self.valid_indices[idx]
 
-        # Get 15m lookback window (direct indexing)
-        x_15m = self.features_15m[actual_idx - self.lookback_15m:actual_idx]
+        # Get 15m lookback window (direct indexing, includes current candle)
+        x_15m = self.features_15m[actual_idx - self.lookback_15m + 1:actual_idx + 1]
 
         # FIXED: Get 1H lookback by subsampling every 4th bar from aligned data
-        # This gives us lookback_1h actual 1H candles worth of data
-        idx_range_1h = range(actual_idx - self.lookback_1h * self.subsample_1h, actual_idx, self.subsample_1h)
+        # This gives us lookback_1h actual 1H candles worth of data, INCLUDING current candle
+        # Note: range() is exclusive at end, so we use actual_idx + 1 to include current
+        idx_range_1h = range(
+            actual_idx - (self.lookback_1h - 1) * self.subsample_1h,
+            actual_idx + 1,
+            self.subsample_1h
+        )
         x_1h = self.features_1h[list(idx_range_1h)]
 
         # FIXED: Get 4H lookback by subsampling every 16th bar from aligned data
-        # This gives us lookback_4h actual 4H candles worth of data
-        idx_range_4h = range(actual_idx - self.lookback_4h * self.subsample_4h, actual_idx, self.subsample_4h)
+        # This gives us lookback_4h actual 4H candles worth of data, INCLUDING current candle
+        idx_range_4h = range(
+            actual_idx - (self.lookback_4h - 1) * self.subsample_4h,
+            actual_idx + 1,
+            self.subsample_4h
+        )
         x_4h = self.features_4h[list(idx_range_4h)]
 
         # Direction target (use float for binary, long for multi-class)

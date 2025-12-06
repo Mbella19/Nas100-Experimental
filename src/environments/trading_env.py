@@ -506,6 +506,10 @@ class TradingEnv(gym.Env):
         """
         Check and execute stop-loss or take-profit if triggered.
 
+        FIXED: Now uses High/Low to detect intra-bar SL/TP hits, not just Close.
+        This creates more realistic training by penalizing the agent for positions
+        that would have been stopped out by intra-bar wicks in real trading.
+
         This method is called BEFORE the agent's action to enforce risk management.
         Stop-loss cuts losing positions early to prevent catastrophic losses.
         Take-profit locks in gains to improve risk/reward ratio.
@@ -517,15 +521,19 @@ class TradingEnv(gym.Env):
         if self.position == 0:
             return 0.0, {}
 
-        # Get current price
-        current_price = self.close_prices[self.current_idx]
+        # Get current bar OHLC
+        close_price = self.close_prices[self.current_idx]
         pip_value = 0.0001
 
-        # Calculate raw pips (before position size adjustment)
-        if self.position == 1:  # Long
-            raw_pips = (current_price - self.entry_price) / pip_value
-        else:  # Short
-            raw_pips = (self.entry_price - current_price) / pip_value
+        # FIXED: Get High/Low for accurate intra-bar SL/TP detection
+        if self.ohlc_data is not None:
+            # ohlc_data shape: (n_samples, 4) = [open, high, low, close]
+            high_price = float(self.ohlc_data[self.current_idx, 1])
+            low_price = float(self.ohlc_data[self.current_idx, 2])
+        else:
+            # Fallback: use close price for all (legacy behavior)
+            high_price = close_price
+            low_price = close_price
 
         # Get ATR for dynamic thresholds
         if len(self.market_features.shape) > 1:
@@ -533,70 +541,138 @@ class TradingEnv(gym.Env):
         else:
             atr = 0.001  # Default fallback
 
-        # Calculate dynamic thresholds
+        # Calculate dynamic thresholds in pips
         sl_pips_threshold = (atr * self.sl_atr_multiplier) / 0.0001
         tp_pips_threshold = (atr * self.tp_atr_multiplier) / 0.0001
-        
+
         # Enforce minimums (e.g. 5 pips) to prevent noise stop-outs
         sl_pips_threshold = max(sl_pips_threshold, 5.0)
         tp_pips_threshold = max(tp_pips_threshold, 5.0)
 
-        # Check stop-loss (loss exceeds threshold)
-        if self.use_stop_loss and raw_pips < -sl_pips_threshold:
-            # Calculate realized PnL
-            pnl = self._calculate_unrealized_pnl()
-            
-            # Close position
-            self.total_pnl += pnl
-            self.trades.append({
-                'entry': self.entry_price,
-                'exit': current_price,
-                'direction': self.position,
-                'size': self.position_size,
-                'pnl': pnl,
-                'close_reason': 'stop_loss'
-            })
-            
-            # Reset
-            self.position = 0
-            self.position_size = 0.0
-            self.entry_price = 0.0
-            self.prev_unrealized_pnl = 0.0
-            
-            # FIX: Scale reward to match action_reward scaling in step()
-            return pnl * self.reward_scaling, {
-                'stop_loss_triggered': True,
-                'trade_closed': True,
-                'close_reason': 'stop_loss',
-                'pnl': pnl  # Keep unscaled for tracking
-            }
+        # Calculate SL/TP price levels
+        if self.position == 1:  # Long
+            sl_price = self.entry_price - sl_pips_threshold * pip_value
+            tp_price = self.entry_price + tp_pips_threshold * pip_value
 
-        # Check take-profit (profit exceeds threshold)
-        if self.use_take_profit and raw_pips > tp_pips_threshold:
-            pnl = self._calculate_unrealized_pnl()
-            
-            self.total_pnl += pnl
-            self.trades.append({
-                'entry': self.entry_price,
-                'exit': current_price,
-                'direction': self.position,
-                'size': self.position_size,
-                'pnl': pnl,
-                'close_reason': 'take_profit'
-            })
-            
-            self.position = 0
-            self.position_size = 0.0
-            self.entry_price = 0.0
-            self.prev_unrealized_pnl = 0.0
-            
-            # FIX: Scale reward to match action_reward scaling in step()
-            return pnl * self.reward_scaling, {
-                'take_profit_triggered': True,
-                'trade_closed': True,
-                'close_reason': 'take_profit',
-                'pnl': pnl  # Keep unscaled for tracking
-            }
+            # For Long: SL triggered if Low <= SL price, TP triggered if High >= TP price
+            # IMPORTANT: Check SL first (worst case) to be conservative
+            if self.use_stop_loss and low_price <= sl_price:
+                # Exit at SL level (not at the low - we don't know exact fill)
+                exit_price = sl_price
+                pnl_pips = -sl_pips_threshold * self.position_size
+                pnl = pnl_pips * 10  # $10 per pip per lot
+
+                self.total_pnl += pnl
+                self.trades.append({
+                    'entry': self.entry_price,
+                    'exit': exit_price,
+                    'direction': self.position,
+                    'size': self.position_size,
+                    'pnl': pnl,
+                    'close_reason': 'stop_loss'
+                })
+
+                # Reset
+                self.position = 0
+                self.position_size = 0.0
+                self.entry_price = 0.0
+                self.prev_unrealized_pnl = 0.0
+
+                return pnl * self.reward_scaling, {
+                    'stop_loss_triggered': True,
+                    'trade_closed': True,
+                    'close_reason': 'stop_loss',
+                    'pnl': pnl
+                }
+
+            if self.use_take_profit and high_price >= tp_price:
+                # Exit at TP level
+                exit_price = tp_price
+                pnl_pips = tp_pips_threshold * self.position_size
+                pnl = pnl_pips * 10
+
+                self.total_pnl += pnl
+                self.trades.append({
+                    'entry': self.entry_price,
+                    'exit': exit_price,
+                    'direction': self.position,
+                    'size': self.position_size,
+                    'pnl': pnl,
+                    'close_reason': 'take_profit'
+                })
+
+                self.position = 0
+                self.position_size = 0.0
+                self.entry_price = 0.0
+                self.prev_unrealized_pnl = 0.0
+
+                return pnl * self.reward_scaling, {
+                    'take_profit_triggered': True,
+                    'trade_closed': True,
+                    'close_reason': 'take_profit',
+                    'pnl': pnl
+                }
+
+        else:  # Short (position == -1)
+            sl_price = self.entry_price + sl_pips_threshold * pip_value
+            tp_price = self.entry_price - tp_pips_threshold * pip_value
+
+            # For Short: SL triggered if High >= SL price, TP triggered if Low <= TP price
+            if self.use_stop_loss and high_price >= sl_price:
+                # Exit at SL level
+                exit_price = sl_price
+                pnl_pips = -sl_pips_threshold * self.position_size
+                pnl = pnl_pips * 10
+
+                self.total_pnl += pnl
+                self.trades.append({
+                    'entry': self.entry_price,
+                    'exit': exit_price,
+                    'direction': self.position,
+                    'size': self.position_size,
+                    'pnl': pnl,
+                    'close_reason': 'stop_loss'
+                })
+
+                self.position = 0
+                self.position_size = 0.0
+                self.entry_price = 0.0
+                self.prev_unrealized_pnl = 0.0
+
+                return pnl * self.reward_scaling, {
+                    'stop_loss_triggered': True,
+                    'trade_closed': True,
+                    'close_reason': 'stop_loss',
+                    'pnl': pnl
+                }
+
+            if self.use_take_profit and low_price <= tp_price:
+                # Exit at TP level
+                exit_price = tp_price
+                pnl_pips = tp_pips_threshold * self.position_size
+                pnl = pnl_pips * 10
+
+                self.total_pnl += pnl
+                self.trades.append({
+                    'entry': self.entry_price,
+                    'exit': exit_price,
+                    'direction': self.position,
+                    'size': self.position_size,
+                    'pnl': pnl,
+                    'close_reason': 'take_profit'
+                })
+
+                self.position = 0
+                self.position_size = 0.0
+                self.entry_price = 0.0
+                self.prev_unrealized_pnl = 0.0
+
+                return pnl * self.reward_scaling, {
+                    'take_profit_triggered': True,
+                    'trade_closed': True,
+                    'close_reason': 'take_profit',
+                    'pnl': pnl
+                }
 
         return 0.0, {}
 
@@ -1054,15 +1130,24 @@ def create_env_from_dataframes(
 
     for i in range(n_samples):
         actual_idx = start_idx + i
-        # 15m: direct indexing
-        data_15m[i] = features_15m[actual_idx - lookback_15m:actual_idx]
-        
-        # FIXED: 1H - subsample every 4th bar from aligned data
-        idx_range_1h = list(range(actual_idx - lookback_1h * subsample_1h, actual_idx, subsample_1h))
+        # 15m: direct indexing (includes current candle)
+        data_15m[i] = features_15m[actual_idx - lookback_15m + 1:actual_idx + 1]
+
+        # FIXED: 1H - subsample every 4th bar from aligned data, INCLUDING current candle
+        # Note: range() is exclusive at end, so we use actual_idx + 1 to include current
+        idx_range_1h = list(range(
+            actual_idx - (lookback_1h - 1) * subsample_1h,
+            actual_idx + 1,
+            subsample_1h
+        ))
         data_1h[i] = features_1h[idx_range_1h]
-        
-        # FIXED: 4H - subsample every 16th bar from aligned data
-        idx_range_4h = list(range(actual_idx - lookback_4h * subsample_4h, actual_idx, subsample_4h))
+
+        # FIXED: 4H - subsample every 16th bar from aligned data, INCLUDING current candle
+        idx_range_4h = list(range(
+            actual_idx - (lookback_4h - 1) * subsample_4h,
+            actual_idx + 1,
+            subsample_4h
+        ))
         data_4h[i] = features_4h[idx_range_4h]
 
     # Close prices for PnL

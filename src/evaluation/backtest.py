@@ -188,16 +188,24 @@ class Backtester:
 
     def _check_stop_loss_take_profit(
         self,
-        price: float,
+        high: float,
+        low: float,
+        close: float,
         time: pd.Timestamp,
         atr: float = 0.001
     ) -> Tuple[float, str]:
         """
         Check and execute stop-loss or take-profit if triggered.
 
+        FIXED: Now uses High/Low to detect intra-bar SL/TP hits, not just Close.
+        This prevents false positives where price wicked through SL/TP but closed safe.
+
         Args:
-            price: Current price
+            high: Current bar high price
+            low: Current bar low price
+            close: Current bar close price
             time: Current timestamp
+            atr: Current ATR for dynamic SL/TP calculation
 
         Returns:
             Tuple of (pnl_pips, close_reason) if triggered, (0, None) otherwise
@@ -205,45 +213,60 @@ class Backtester:
         if self.position == 0:
             return 0.0, None
 
-        # Calculate raw pips (before position size)
-        raw_pips = self._calculate_pnl_pips(price)
+        # Calculate dynamic SL/TP thresholds in pips
+        sl_pips_threshold = (atr * self.sl_atr_multiplier) / 0.0001
+        tp_pips_threshold = (atr * self.tp_atr_multiplier) / 0.0001
 
-        # Calculate dynamic SL/TP in pips
-        sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
-        tp_pips = (atr * self.tp_atr_multiplier) / 0.0001
-        
         # Ensure minimum values
-        sl_pips = max(sl_pips, 5.0)
-        tp_pips = max(tp_pips, 5.0)
+        sl_pips_threshold = max(sl_pips_threshold, 5.0)
+        tp_pips_threshold = max(tp_pips_threshold, 5.0)
 
-        # Check stop-loss (loss exceeds threshold)
-        if self.use_stop_loss and raw_pips < -sl_pips:
-            pnl = self._close_position(price, time)
-            # Mark the trade as stop-loss
-            if self.trades:
-                self.trades[-1] = TradeRecord(
-                    entry_time=self.trades[-1].entry_time,
-                    exit_time=self.trades[-1].exit_time,
-                    entry_price=self.trades[-1].entry_price,
-                    exit_price=self.trades[-1].exit_price,
-                    direction=self.trades[-1].direction,
-                    size=self.trades[-1].size,
-                    pnl_pips=self.trades[-1].pnl_pips,
-                    pnl_percent=self.trades[-1].pnl_percent,
-                )
-            return pnl, 'stop_loss'
+        # Calculate SL/TP price levels
+        pip_value = 0.0001
+        if self.position == 1:  # Long
+            sl_price = self.entry_price - sl_pips_threshold * pip_value
+            tp_price = self.entry_price + tp_pips_threshold * pip_value
 
-        # Check take-profit (profit exceeds threshold)
-        if self.use_take_profit and raw_pips > tp_pips:
-            pnl = self._close_position(price, time)
-            return pnl, 'take_profit'
+            # For Long: SL triggered if Low <= SL price, TP triggered if High >= TP price
+            # IMPORTANT: Check SL first (worst case) to be conservative
+            if self.use_stop_loss and low <= sl_price:
+                # Exit at SL level (not at the low - we don't know exact fill)
+                exit_price = sl_price
+                pnl = self._close_position(exit_price, time)
+                return pnl, 'stop_loss'
+
+            if self.use_take_profit and high >= tp_price:
+                # Exit at TP level
+                exit_price = tp_price
+                pnl = self._close_position(exit_price, time)
+                return pnl, 'take_profit'
+
+        else:  # Short (position == -1)
+            sl_price = self.entry_price + sl_pips_threshold * pip_value
+            tp_price = self.entry_price - tp_pips_threshold * pip_value
+
+            # For Short: SL triggered if High >= SL price, TP triggered if Low <= TP price
+            # IMPORTANT: Check SL first (worst case) to be conservative
+            if self.use_stop_loss and high >= sl_price:
+                # Exit at SL level
+                exit_price = sl_price
+                pnl = self._close_position(exit_price, time)
+                return pnl, 'stop_loss'
+
+            if self.use_take_profit and low <= tp_price:
+                # Exit at TP level
+                exit_price = tp_price
+                pnl = self._close_position(exit_price, time)
+                return pnl, 'take_profit'
 
         return 0.0, None
 
     def step(
         self,
         action: np.ndarray,
-        price: float,
+        high: float,
+        low: float,
+        close: float,
         time: pd.Timestamp,
         atr: float = 0.001,
         spread_pips: float = 1.5
@@ -251,10 +274,15 @@ class Backtester:
         """
         Execute one step of the backtest.
 
+        FIXED: Now accepts high/low/close for accurate intra-bar SL/TP detection.
+
         Args:
             action: [direction, size_idx] where direction is 0=Flat, 1=Long, 2=Short
-            price: Current close price
+            high: Current bar high price (for SL/TP checks)
+            low: Current bar low price (for SL/TP checks)
+            close: Current bar close price (for position opening/closing)
             time: Current timestamp
+            atr: Current ATR for volatility sizing
             spread_pips: Spread in pips
 
         Returns:
@@ -263,22 +291,22 @@ class Backtester:
         direction = action[0]
         size_idx = action[1]
         base_size_factor = [0.25, 0.5, 0.75, 1.0][size_idx]
-        
+
         # Volatility Sizing: Calculate lot size based on risk
         if self.volatility_sizing:
             # Calculate SL distance in pips
             sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
             sl_pips = max(sl_pips, 5.0)
-            
+
             # Risk Formula: Risk = Lots * 10 * SL_pips
             # Lots = Risk / (10 * SL_pips)
             # We use base_size_factor to scale the risk (e.g. 0.5x risk)
-            
+
             risk_amount = self.risk_per_trade * base_size_factor
             size = risk_amount / (10 * sl_pips)
-            
+
             # Cap size to avoid crazy leverage in ultra-low vol
-            size = min(size, 50.0) # Max 50 lots
+            size = min(size, 50.0)  # Max 50 lots
         else:
             # Fixed sizing (1 lot * factor)
             size = 1.0 * base_size_factor
@@ -287,7 +315,8 @@ class Backtester:
 
         # FIRST: Check stop-loss/take-profit BEFORE agent action
         # This enforces risk management regardless of what the agent wants to do
-        sl_tp_pnl, close_reason = self._check_stop_loss_take_profit(price, time, atr)
+        # FIXED: Now uses high/low for accurate intra-bar SL/TP detection
+        sl_tp_pnl, close_reason = self._check_stop_loss_take_profit(high, low, close, time, atr)
         if sl_tp_pnl != 0.0:
             pnl += sl_tp_pnl
             # Position is now flat after SL/TP, agent can still open new position
@@ -295,22 +324,22 @@ class Backtester:
         # Handle agent's action
         if direction == 0:  # Flat/Exit
             if self.position != 0:
-                pnl += self._close_position(price, time)
+                pnl += self._close_position(close, time)
 
         elif direction == 1:  # Long
             if self.position == -1:  # Close short first
-                pnl += self._close_position(price, time)
+                pnl += self._close_position(close, time)
             if self.position == 0:  # Open long
-                self._open_position(1, size, price, time, spread_pips)
+                self._open_position(1, size, close, time, spread_pips)
 
         elif direction == 2:  # Short
             if self.position == 1:  # Close long first
-                pnl += self._close_position(price, time)
+                pnl += self._close_position(close, time)
             if self.position == 0:  # Open short
-                self._open_position(-1, size, price, time, spread_pips)
+                self._open_position(-1, size, close, time, spread_pips)
 
-        # Record equity (mark-to-market)
-        unrealized_pnl = self._calculate_pnl_pips(price) * 10 * self.position_size
+        # Record equity (mark-to-market using close price)
+        unrealized_pnl = self._calculate_pnl_pips(close) * 10 * self.position_size
         self.equity_history.append(self.balance + unrealized_pnl)
 
         # Record action and position
@@ -413,24 +442,32 @@ def run_backtest(
         # Step environment
         obs, reward, done, truncated, info = env.step(action)
 
-        # Get price from environment
-        price = env.close_prices[env.current_idx - 1]  # Previous close (current bar)
+        # Get OHLC from environment
+        # env.current_idx points to NEXT step after env.step(), so current bar is at current_idx-1
+        bar_idx = env.current_idx - 1
+
+        # FIXED: Extract High/Low/Close for accurate intra-bar SL/TP detection
+        if hasattr(env, 'ohlc_data') and env.ohlc_data is not None:
+            # ohlc_data shape: (n_samples, 4) = [open, high, low, close]
+            high = float(env.ohlc_data[bar_idx, 1])
+            low = float(env.ohlc_data[bar_idx, 2])
+            close = float(env.ohlc_data[bar_idx, 3])
+        else:
+            # Fallback: use close price for all (legacy behavior)
+            close = env.close_prices[bar_idx]
+            high = close
+            low = close
 
         # Create timestamp (or use step number)
         time = pd.Timestamp.now() + pd.Timedelta(minutes=15 * step)
 
-        # Get ATR from environment (current index - 1 because step hasn't incremented yet for next obs?)
-        # Actually env.current_idx points to NEXT step, so current state is at current_idx-1
-        # But wait, env.step() increments current_idx. So after env.step(), current_idx is for NEXT step.
-        # The price we got is from env.close_prices[env.current_idx - 1].
-        # So we should use the same index for ATR.
-        
+        # Get ATR from environment
         atr = 0.001
         if hasattr(env, 'market_features') and len(env.market_features.shape) > 1:
-             atr = env.market_features[env.current_idx - 1, 0]
+            atr = env.market_features[bar_idx, 0]
 
-        # Step backtester
-        backtester.step(action, price, time, atr=atr)
+        # Step backtester with high/low/close for accurate SL/TP detection
+        backtester.step(action, high, low, close, time, atr=atr)
 
         step += 1
 
