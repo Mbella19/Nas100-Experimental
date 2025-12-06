@@ -60,12 +60,12 @@ class TradingEnv(gym.Env):
         lookback_4h: int = 12,
         spread_pips: float = 0.2,     # Razor/Raw spread
         slippage_pips: float = 0.5,   # Includes commission + slippage
-        fomo_penalty: float = -0.05,  # Reduced from -0.5 (was dominating PnL rewards)
-        chop_penalty: float = -0.01,  # Reduced from -0.1
+        fomo_penalty: float = 0.0,    # Disabled for stability
+        chop_penalty: float = 0.0,    # Disabled for stability
         fomo_threshold_atr: float = 2.0,  # Only trigger on significant moves
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
         max_steps: int = 500,         # ~1 week for rapid regime cycling
-        reward_scaling: float = 0.5,  # Increased to make PnL signal stronger vs penalties
+        reward_scaling: float = 0.01, # Reduced to 1.0 per 100 pips (was 0.5)
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
@@ -563,11 +563,12 @@ class TradingEnv(gym.Env):
             self.entry_price = 0.0
             self.prev_unrealized_pnl = 0.0
             
-            return pnl, {
+            # FIX: Scale reward to match action_reward scaling in step()
+            return pnl * self.reward_scaling, {
                 'stop_loss_triggered': True,
                 'trade_closed': True,
                 'close_reason': 'stop_loss',
-                'pnl': pnl
+                'pnl': pnl  # Keep unscaled for tracking
             }
 
         # Check take-profit (profit exceeds threshold)
@@ -589,11 +590,12 @@ class TradingEnv(gym.Env):
             self.entry_price = 0.0
             self.prev_unrealized_pnl = 0.0
             
-            return pnl, {
+            # FIX: Scale reward to match action_reward scaling in step()
+            return pnl * self.reward_scaling, {
                 'take_profit_triggered': True,
                 'trade_closed': True,
                 'close_reason': 'take_profit',
-                'pnl': pnl
+                'pnl': pnl  # Keep unscaled for tracking
             }
 
         return 0.0, {}
@@ -714,11 +716,11 @@ class TradingEnv(gym.Env):
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 reward += final_delta * self.reward_scaling  # Capture final leg!
 
-                # Direction bonus: reward correct direction predictions
-                # FIXED: Scale by position_size and reward_scaling to match PnL scaling
-                if final_unrealized > 0:
-                    reward += 5.0 * self.position_size * self.reward_scaling  # ~5 pip bonus scaled
-                    info['direction_bonus'] = True
+                # REMOVED: Direction bonus was causing reward-PnL divergence
+                # The bonus (+2.5 for ANY profitable trade) was 50x larger than
+                # the PnL reward for tiny winners, teaching agent to make many
+                # small trades to collect bonuses regardless of actual profitability.
+                # PnL delta (above) is now the ONLY source of reward for exits.
 
                 # Record trade statistics
                 info['trade_closed'] = True
@@ -746,11 +748,7 @@ class TradingEnv(gym.Env):
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 reward += final_delta * self.reward_scaling  # Capture final leg!
 
-                # Direction bonus: reward correct direction predictions
-                # FIXED: Scale by position_size and reward_scaling to match PnL scaling
-                if final_unrealized > 0:
-                    reward += 5.0 * self.position_size * self.reward_scaling  # ~5 pip bonus scaled
-                    info['direction_bonus'] = True
+                # REMOVED: Direction bonus (see comment in Flat/Exit case above)
 
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized
@@ -793,11 +791,7 @@ class TradingEnv(gym.Env):
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 reward += final_delta * self.reward_scaling  # Capture final leg!
 
-                # Direction bonus: reward correct direction predictions
-                # Scaled by position_size * reward_scaling for consistency with backtest
-                if final_unrealized > 0:
-                    reward += 5.0 * self.position_size * self.reward_scaling  # ~5 pip bonus scaled
-                    info['direction_bonus'] = True
+                # REMOVED: Direction bonus (see comment in Flat/Exit case above)
 
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized
@@ -836,18 +830,20 @@ class TradingEnv(gym.Env):
         # Continuous PnL feedback: reward based on CHANGE in unrealized PnL each step.
         # This prevents the "death spiral" where holding in chop accumulates penalties
         # with no offsetting reward until exit.
-        # FIXED: This is now the ONLY source of PnL reward (no duplicate on exit).
-        current_unrealized_pnl = self._calculate_unrealized_pnl()
-        pnl_delta = current_unrealized_pnl - self.prev_unrealized_pnl
-
+        #
+        # NOTE: This block only runs for OPEN positions. On exit, the final_delta is
+        # captured above BEFORE resetting position, and prev_unrealized_pnl is reset to 0.
+        # Then this block sees position=0 and skips, preventing double-counting.
         if self.position != 0:
-            # Add the CHANGE in unrealized PnL to reward each step
+            current_unrealized_pnl = self._calculate_unrealized_pnl()
+            pnl_delta = current_unrealized_pnl - self.prev_unrealized_pnl
             reward += pnl_delta * self.reward_scaling
             info['unrealized_pnl'] = current_unrealized_pnl
             info['pnl_delta'] = pnl_delta
-
-        # Update for next step
-        self.prev_unrealized_pnl = current_unrealized_pnl
+            self.prev_unrealized_pnl = current_unrealized_pnl
+        else:
+            # Position is flat - ensure tracking is reset
+            self.prev_unrealized_pnl = 0.0
 
         # FOMO penalty: flat during high momentum move
         if self.position == 0:

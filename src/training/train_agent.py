@@ -249,10 +249,10 @@ class AgentTrainingLogger(BaseCallback):
                 # Construct reward components
                 reward_components = {
                     'pnl_delta': info.get('pnl_delta', 0.0),
-                    'direction_bonus': 5.0 * info.get('position_size', 0.0) * 0.1 if info.get('direction_bonus') else 0.0, # Approx
+                    'direction_bonus': 0.0,  # REMOVED: Was causing reward-PnL divergence
                     'confidence_bonus': info.get('confidence_bonus', 0.0),
-                    'fomo_penalty': -0.2 if info.get('fomo_triggered') else 0.0, # Default from env
-                    'chop_penalty': -0.1 if info.get('chop_triggered') else 0.0, # Default from env
+                    'fomo_penalty': -0.05 if info.get('fomo_triggered') else 0.0,
+                    'chop_penalty': -0.01 if info.get('chop_triggered') else 0.0,
                     'transaction_cost': 0.0, # Hard to track exact cost here without env access
                     'total': float(reward)
                 }
@@ -657,12 +657,12 @@ def create_trading_env(
     # Default configuration (matches config/settings.py fixes)
     spread_pips = 0.2       # Razor/Raw spread
     slippage_pips = 0.5     # Includes commission + slippage
-    fomo_penalty = -0.05    # Reduced from -0.5 (was dominating PnL rewards)
-    chop_penalty = -0.01    # Reduced from -0.1
+    fomo_penalty = 0.0      # Disabled
+    chop_penalty = 0.0      # Disabled
     fomo_threshold_atr = 2.0  # Only trigger on significant moves
     chop_threshold = 80.0   # Only extreme chop triggers penalty
     max_steps = 500
-    reward_scaling = 0.5    # Increased to make PnL signal stronger vs penalties
+    reward_scaling = 0.01   # 1.0 per 100 pips
     context_dim = 64
     
     # Risk Management defaults

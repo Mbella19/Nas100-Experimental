@@ -189,11 +189,11 @@ class TradingConfig:
     # Reward Params
     # FIX: Previous penalties were 10x too high, dominating PnL rewards
     # A 50-pip trade at 0.2 scaling = 10 reward, but 30x FOMO @ -0.5 = -15 penalty
-    fomo_penalty: float = -0.05   # Was -0.5 (10x reduction - now ~2.5 pip equivalent)
-    chop_penalty: float = -0.01   # Was -0.05 (5x reduction - now ~0.5 pip equivalent)
+    fomo_penalty: float = 0.0     # Disabled
+    chop_penalty: float = 0.0     # Disabled
     fomo_threshold_atr: float = 2.0  # Was 1.0 (only trigger on significant moves)
     chop_threshold: float = 80.0     # Was 70.0 (only extreme chop triggers penalty)
-    reward_scaling: float = 0.5      # Was 0.2 (PnL signal now 2.5x stronger vs penalties)
+    reward_scaling: float = 0.01     # 1.0 per 100 pips
     
     # These are mostly unused now but keep for compatibility if needed
     use_stop_loss: bool = True
@@ -211,13 +211,13 @@ class AgentConfig:
     # PPO hyperparameters (from CLAUDE.md spec)
     # FIX: Reduced LR for stable convergence, increased entropy to escape local minima
     learning_rate: float = 1e-4  # Was 3e-4 (reduced for more stable updates)
-    n_steps: int = 512          # Reduced from 2048 to save memory
-    batch_size: int = 64
-    n_epochs: int = 10
+    n_steps: int = 2048         # Increased for better batching
+    batch_size: int = 256       # Increased from 64
+    n_epochs: int = 20
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.05       # Was 0.02 (increased to escape frozen action distribution)
+    ent_coef: float = 0.02       # Standard exploration
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -226,7 +226,7 @@ class AgentConfig:
 
     # Policy network
     policy_type: str = "MlpPolicy"
-    net_arch: List[int] = field(default_factory=lambda: [128, 128])
+    net_arch: List[int] = field(default_factory=lambda: [256, 256])
 
 
 @dataclass

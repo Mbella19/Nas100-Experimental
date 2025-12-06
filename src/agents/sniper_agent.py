@@ -91,12 +91,12 @@ class SniperAgent:
         env: gym.Env,
         learning_rate: float = 3e-4,
         n_steps: int = 2048,
-        batch_size: int = 64,
-        n_epochs: int = 10,
+        batch_size: int = 256,        # Increased from 64 for stability
+        n_epochs: int = 20,           # Increased from 10
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_range: float = 0.2,
-        ent_coef: float = 0.01,
+        ent_coef: float = 0.02,       # Increased for exploration
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         net_arch: Optional[list] = None,
@@ -129,7 +129,7 @@ class SniperAgent:
 
         # Network architecture
         if net_arch is None:
-            net_arch = [128, 128]
+            net_arch = [256, 256]
 
         policy_kwargs = {
             'net_arch': dict(pi=net_arch, vf=net_arch)

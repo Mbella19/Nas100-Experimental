@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 def detect_pinbar(
     df: pd.DataFrame,
-    wick_ratio: float = 2.0
+    wick_ratio: float = 2.0,
+    min_body_pips: float = 0.0002,
+    min_range_pips: float = 0.0005
 ) -> pd.Series:
     """
     Detect pinbar candles (rejection candles with long wicks).
@@ -33,19 +35,25 @@ def detect_pinbar(
     Args:
         df: OHLCV DataFrame
         wick_ratio: Minimum wick-to-body ratio
+        min_body_pips: Minimum body size in price units (0.0002 = 2 pips for EURUSD)
+        min_range_pips: Minimum candle range in price units (0.0005 = 5 pips for EURUSD)
 
     Returns:
         Series with values: 1 (bullish), -1 (bearish), 0 (none)
     """
     body = abs(df['close'] - df['open'])
+    total_range = df['high'] - df['low']
     upper_wick = df['high'] - df[['open', 'close']].max(axis=1)
     lower_wick = df[['open', 'close']].min(axis=1) - df['low']
 
-    # Avoid division by zero
-    body = body.replace(0, 1e-10)
+    # Filter out noise candles that are too small to be meaningful
+    valid_candle = (body > min_body_pips) & (total_range > min_range_pips)
 
-    bullish_pinbar = (lower_wick / body > wick_ratio) & (lower_wick > upper_wick)
-    bearish_pinbar = (upper_wick / body > wick_ratio) & (upper_wick > lower_wick)
+    # Avoid division by zero
+    body_safe = body.replace(0, 1e-10)
+
+    bullish_pinbar = (lower_wick / body_safe > wick_ratio) & (lower_wick > upper_wick) & valid_candle
+    bearish_pinbar = (upper_wick / body_safe > wick_ratio) & (upper_wick > lower_wick) & valid_candle
 
     result = pd.Series(0, index=df.index, dtype=np.float32)
     result[bullish_pinbar] = 1
@@ -473,13 +481,16 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     # True Range
     atr_val = atr(df, period)
 
-    # Smoothed +DI and -DI
-    plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / atr_val.replace(0, 1e-10))
-    minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / atr_val.replace(0, 1e-10))
+    # Smoothed +DI and -DI using Wilder's smoothing (alpha = 1/period)
+    # Standard ADX uses Wilder's EMA, NOT span-based EMA
+    # Wilder's: alpha = 1/N ≈ 0.071 for N=14
+    # Span-based: alpha = 2/(N+1) ≈ 0.133 for N=14 (too reactive)
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr_val.replace(0, 1e-10))
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr_val.replace(0, 1e-10))
 
-    # DX and ADX
+    # DX and ADX (also using Wilder's smoothing)
     dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
-    adx_val = dx.ewm(span=period, adjust=False).mean()
+    adx_val = dx.ewm(alpha=1/period, adjust=False).mean()
 
     return adx_val.astype(np.float32)
 

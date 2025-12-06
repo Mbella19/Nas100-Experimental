@@ -4,9 +4,9 @@ Multi-timeframe resampling module.
 Resamples 1-minute OHLCV data to 15m, 1H, and 4H timeframes
 with proper gap handling via forward-fill on complete datetime index.
 
-CRITICAL: Uses label='right' to prevent look-ahead bias!
-- With label='left' (default): Row labeled 10:00 contains 10:00-10:59 data
-- With label='right': Row labeled 11:00 contains 10:00-10:59 data
+CRITICAL: Uses label='right' + closed='left' to prevent look-ahead bias!
+- closed='left': Bins are [10:00, 11:00) - includes 10:00, excludes 11:00
+- label='right': Row labeled 11:00 contains 10:00-10:59 data
 
 At 10:15, we can only know the COMPLETED 9:00-10:00 hourly candle (labeled 10:00 with right),
 not the in-progress 10:00-11:00 candle. This prevents future data leakage.
@@ -78,10 +78,10 @@ def resample_ohlcv(
     # Select only columns that exist
     rules = {col: rule for col, rule in ohlcv_rules.items() if col in df.columns}
 
-    # Resample with label='right' to prevent look-ahead bias
+    # Resample with label='right' + closed='left' to prevent look-ahead bias
+    # closed='left': interval is [10:00, 11:00) - includes 10:00, excludes 11:00
     # label='right': timestamp is END of period (when candle completes)
-    # closed='right': interval includes right endpoint (10:01-11:00 for 1H)
-    resampled = df.resample(freq, label='right', closed='right').agg(rules)
+    resampled = df.resample(freq, label='right', closed='left').agg(rules)
 
     if fill_gaps:
         # Create complete index and reindex
@@ -155,8 +155,8 @@ def align_timeframes(
     - Forward-fill ensures at time T, we only see candles that completed at/before T
 
     Example at 10:15 (15m candle):
-    - 1H candles labeled: 09:00 (8:01-9:00), 10:00 (9:01-10:00), 11:00 (10:01-11:00)
-    - Forward-fill at 10:15 gives us the 10:00 candle (9:01-10:00 data) ✓ CORRECT
+    - 1H candles labeled: 09:00 (8:00-8:59), 10:00 (9:00-9:59), 11:00 (10:00-10:59)
+    - Forward-fill at 10:15 gives us the 10:00 candle (9:00-9:59 data) ✓ CORRECT
     - Without label='right', we'd get 10:00 candle with 10:00-10:59 data ✗ WRONG
 
     Args:
