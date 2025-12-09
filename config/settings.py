@@ -188,13 +188,18 @@ class TradingConfig:
     max_position_size: float = 5.0
     
     # Reward Params
-    # FIX: Previous penalties were 10x too high, dominating PnL rewards
-    # A 50-pip trade at 0.2 scaling = 10 reward, but 30x FOMO @ -0.5 = -15 penalty
-    fomo_penalty: float = -0.05   # Small penalty (-5 pips equiv) for missing moves
+    # FIX v15: Previous reward_scaling (0.1) was too weak - trades didn't produce
+    # meaningful learning signal. FOMO penalty (-0.05) was too small to matter.
+    # New values encourage exploration while still being proportional to PnL.
+    fomo_penalty: float = -1.0    # Meaningful penalty for missing moves (was -0.05)
     chop_penalty: float = 0.0     # Disabled
-    fomo_threshold_atr: float = 2  # Trigger on >1.5x ATR moves (was 2.0)
-    chop_threshold: float = 80.0     # Was 70.0 (only extreme chop triggers penalty)
-    reward_scaling: float = 0.01     # 1.0 per 100 pips
+    fomo_threshold_atr: float = 1.5  # Trigger on >1.5x ATR moves (was 2.0)
+    chop_threshold: float = 80.0     # Only extreme chop triggers penalty
+    reward_scaling: float = 1.0     # 1.0 per 1 pip (was 0.1 = 1.0 per 10 pips)
+
+    # Trade entry bonus: Offsets entry cost to encourage exploration
+    # Without this, every trade starts negative (spread + slippage) discouraging action
+    trade_entry_bonus: float = 0.5  # Bonus for opening a position
     
     # These are mostly unused now but keep for compatibility if needed
     use_stop_loss: bool = True
@@ -205,7 +210,7 @@ class TradingConfig:
     initial_balance: float = 10000.0
     
     # Validation
-    noise_level: float = 0.02  # Reduced to 2% to encourage more activity (was 5%)
+    noise_level: float = 0.05  # Reduced to 2% to encourage more activity (was 5%)
 
 
 @dataclass
@@ -213,24 +218,26 @@ class AgentConfig:
     """PPO Sniper Agent configuration."""
 
     # PPO hyperparameters (from CLAUDE.md spec)
-    # FIX: Reduced LR for stable convergence, increased entropy to escape local minima
-    learning_rate: float = 3e-4  # Increased to 3e-4 to help escape local minima
-    n_steps: int = 2048         # Increased for better batching
-    batch_size: int = 256       # Increased from 64
-    n_epochs: int = 20          # Reduced to 10 to prevent overfitting
+    # FIX v15: Previous ent_coef (0.01) caused rapid policy collapse to flat.
+    # For a 12-action discrete space, higher entropy is needed to maintain exploration.
+    learning_rate: float = 3e-4  # Higher initial LR for faster learning (was 1e-4)
+    n_steps: int = 2048         # Timesteps per update
+    batch_size: int = 256       # Minibatch size
+    n_epochs: int = 10          # Reduced to prevent overfitting (was 20)
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.05       # Increased to 5% to FORCE exploration (unfreeze)
+    ent_coef: float = 0.1        # HIGH entropy to force exploration (was 0.01)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
     # Training
-    total_timesteps: int = 5_000_000
+    total_timesteps: int = 20_000_000
 
     # Policy network
+    # FIX v15: [64, 64] may bottleneck for 49-dim input with 12-action output
     policy_type: str = "MlpPolicy"
-    net_arch: List[int] = field(default_factory=lambda: [64, 64])
+    net_arch: List[int] = field(default_factory=lambda: [256, 256])
 
 
 @dataclass

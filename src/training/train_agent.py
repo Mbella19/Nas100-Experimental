@@ -663,16 +663,18 @@ def create_trading_env(
     Returns:
         TradingEnv instance
     """
-    # Default configuration (matches config/settings.py fixes)
+    # Default configuration (matches config/settings.py v15 fixes)
+    # FIX v15: Previous defaults (fomo=0.0, reward_scaling=0.01) caused flat convergence
     spread_pips = 0.2       # Razor/Raw spread
     slippage_pips = 0.5     # Includes commission + slippage
-    fomo_penalty = 0.0      # Disabled
+    fomo_penalty = -1.0     # Meaningful penalty for missing moves (was 0.0)
     chop_penalty = 0.0      # Disabled
-    fomo_threshold_atr = 2.0  # Only trigger on significant moves
+    fomo_threshold_atr = 1.5  # Trigger on >1.5x ATR moves (was 2.0)
     chop_threshold = 80.0   # Only extreme chop triggers penalty
     max_steps = 500
-    reward_scaling = 0.01   # 1.0 per 100 pips
+    reward_scaling = 1.0    # 1.0 per 1 pip (was 0.01 = 1.0 per 100 pips)
     context_dim = 64
+    trade_entry_bonus = 0.5  # Bonus for opening positions (encourages exploration)
     
     # Risk Management defaults
     sl_atr_multiplier = 1.5
@@ -710,10 +712,13 @@ def create_trading_env(
         use_take_profit = getattr(trading_cfg, 'use_take_profit', use_take_profit)
         # Analyst Alignment
         enforce_analyst_alignment = getattr(trading_cfg, 'enforce_analyst_alignment', enforce_analyst_alignment)
+        # v15: Trade entry bonus
+        trade_entry_bonus = getattr(trading_cfg, 'trade_entry_bonus', trade_entry_bonus)
 
         # Log config values to verify they're applied
         logger.info(f"Config applied: fomo_penalty={fomo_penalty}, reward_scaling={reward_scaling}, "
-                    f"slippage_pips={slippage_pips}, enforce_analyst_alignment={enforce_analyst_alignment}")
+                    f"slippage_pips={slippage_pips}, trade_entry_bonus={trade_entry_bonus}, "
+                    f"enforce_analyst_alignment={enforce_analyst_alignment}")
 
     if analyst_model is not None:
         context_dim = analyst_model.context_dim
@@ -737,9 +742,10 @@ def create_trading_env(
         fomo_threshold_atr=fomo_threshold_atr,
         chop_threshold=chop_threshold,
         max_steps=max_steps,
-        reward_scaling=config.reward_scaling if config else 0.01,
+        reward_scaling=reward_scaling,  # v15 FIX: Use local variable, not config directly
+        trade_entry_bonus=trade_entry_bonus,  # v15: Exploration bonus
         device=device,
-        noise_level=config.noise_level if config else 0.0,
+        noise_level=getattr(config, 'noise_level', 0.0) if config else 0.0,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
         # Risk Management

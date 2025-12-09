@@ -78,25 +78,27 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 ```python
 # Continuous PnL: reward based on CHANGE in unrealized PnL each step
 pnl_delta = current_unrealized_pnl - prev_unrealized_pnl
-reward = pnl_delta * reward_scaling  # reward_scaling = 0.2
+reward = pnl_delta * reward_scaling  # reward_scaling = 1.0 (v15: 1 reward per pip)
 
 # Transaction cost when opening (NOT closing)
 if opened_trade:
     reward -= spread_pips * position_size * reward_scaling
+    reward += trade_entry_bonus  # v15: +0.5 to encourage exploration
 
-# FOMO: -0.5 if flat during high-momentum moves (|price_move| > 1*ATR)
-# Chop: -0.05 if holding position when CHOP > 70
+# FOMO: -1.0 if flat during high-momentum moves (|price_move| > 1.5*ATR)
+# Chop: disabled (was causing over-penalization)
 ```
 
 **CRITICAL FIX**: The environment uses **continuous PnL rewards** (delta each step) instead of exit-only rewards to prevent "death spiral" where holding in choppy markets accumulates penalties with no offsetting reward until exit.
 
 ### PPO Agent (src/agents/sniper_agent.py)
 
-**Stable Baselines 3 Configuration**:
+**Stable Baselines 3 Configuration (v15)**:
 ```python
-PPO("MlpPolicy", env, learning_rate=3e-4, n_steps=512, batch_size=64,
+PPO("MlpPolicy", env, learning_rate=3e-4, n_steps=2048, batch_size=256,
     n_epochs=10, gamma=0.99, gae_lambda=0.95, clip_range=0.2,
-    ent_coef=0.02, vf_coef=0.5, max_grad_norm=0.5, device="mps")
+    ent_coef=0.1, vf_coef=0.5, max_grad_norm=0.5, device="mps",
+    policy_kwargs={'net_arch': [256, 256]})
 ```
 
 **MPS Fallback**: If MPS fails, fall back to CPU for SB3 (limited MPS support)
@@ -194,6 +196,17 @@ except:
 - Separate normalizers per timeframe (15m, 1H, 4H) saved to `models/analyst/normalizer_{tf}.pkl`
 - Prevents scale inconsistencies (ATR ~0.001 vs CHOP 0-100 vs price ~1.05)
 
+**Policy Collapse Fix (v15)**:
+- Agent was converging to 99% flat after 4.5M timesteps due to weak reward signal and low entropy
+- **Root causes**: `reward_scaling=0.01` (too weak), `ent_coef=0.01` (rapid policy collapse), `fomo_penalty=-0.05` (too small)
+- **Fixes applied**:
+  - `reward_scaling`: 0.01 → 1.0 (100x increase, 1 reward per pip)
+  - `ent_coef`: 0.01 → 0.1 (10x increase, forces exploration)
+  - `fomo_penalty`: -0.05 → -1.0 (20x increase, meaningful punishment for inaction)
+  - `net_arch`: [64, 64] → [256, 256] (larger policy network)
+  - `trade_entry_bonus`: NEW - 0.5 bonus for opening positions (offsets entry cost)
+- Must delete old checkpoints and retrain from scratch (policy has converged to degenerate state)
+
 ## Common Pitfalls
 
 | Pitfall | Solution |
@@ -207,6 +220,7 @@ except:
 | Choppy markets | Chop avoidance penalty |
 | Death spiral in chop | Use continuous PnL delta, not exit-only rewards |
 | Timeframe misalignment | Forward-fill all to 15m, then subsample higher TFs |
+| **Policy collapse to flat (v15)** | **ent_coef=0.1, reward_scaling=1.0, trade_entry_bonus=0.5, fomo_penalty=-1.0** |
 
 ## Validation Checklist
 
@@ -311,23 +325,26 @@ callback = AgentTrainingLogger(log_dir="models/agent", enable_visualization=True
 ## Key Architecture Details
 
 **Analyst Context Flow**:
-1. `TemporalEncoder` (Transformer or Conv1D) per timeframe → [batch, d_model]
+1. `TemporalEncoder` (TCN or Transformer) per timeframe → [batch, d_model=32]
 2. `AttentionFusion` combines encodings → [batch, d_model]
-3. `context_proj` (Linear + LayerNorm) → [batch, context_dim=64]
+3. `context_proj` (Linear + LayerNorm) → [batch, context_dim=32]
 4. During RL: context vector precomputed for all samples, cached in `TradingEnv._precomputed_contexts`
 
-**Environment Observation Construction** (trading_env.py:256):
+**Environment Observation Construction** (trading_env.py):
 ```python
-obs = [context_vector (64), analyst_metrics (5), position_state (3), market_features (5)]  # Total: 77 dims
+obs = [context_vector (32), analyst_metrics (5), position_state (3), market_features (7), sl_tp_dist (2)]  # Total: 49 dims
+# context_vector: frozen analyst embeddings
 # analyst_metrics: [p_down, p_up, edge, confidence, uncertainty]
 # position_state: [position {-1,0,1}, entry_price_norm, unrealized_pnl_norm]
-# market_features (Z-normalized): [atr, chop, adx, regime, sma_distance]
+# market_features (Z-normalized): [atr, chop, adx, regime, sma_distance, bos, choch]
+# sl_tp_dist: [distance to SL, distance to TP] normalized by ATR
 ```
 
-**Reward Scaling Logic** (config/settings.py:144):
-- `reward_scaling = 0.2` converts ±10 pip trade to ±2.0 reward
-- Makes penalties (-0.5 FOMO, -0.05 chop) meaningful vs PnL
-- Encourages "Sniper" behavior: selective, high-quality trades
+**Reward Scaling Logic (v15)** (config/settings.py):
+- `reward_scaling = 1.0` converts ±1 pip trade to ±1.0 reward (direct mapping)
+- `trade_entry_bonus = 0.5` offsets entry costs (~0.7 pips) to encourage exploration
+- `fomo_penalty = -1.0` makes missing momentum moves costly
+- Encourages "Sniper" behavior: selective, high-quality trades after exploration phase
 
 ## Debugging & Monitoring
 
@@ -348,4 +365,45 @@ obs = [context_vector (64), analyst_metrics (5), position_state (3), market_feat
 print(f"Train end: {train_end_idx}, Total samples: {len(df_15m)}")
 # Verify market_feat_mean/std computed from train_market_features[:split_idx]
 # Verify test env receives same train stats, NOT test stats
+```
+
+## Current Hyperparameters (v15)
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `reward_scaling` | 1.0 | 1 reward per pip |
+| `ent_coef` | 0.1 | High exploration (was 0.01) |
+| `fomo_penalty` | -1.0 | Punish inaction (was -0.05) |
+| `trade_entry_bonus` | 0.5 | Encourage trading (NEW) |
+| `net_arch` | [256, 256] | Larger network (was [64, 64]) |
+| `learning_rate` | 3e-4 | Standard |
+| `n_steps` | 2048 | Steps per update |
+| `batch_size` | 256 | Minibatch size |
+| `total_timesteps` | 20M | Long training run |
+
+## Training Progress Indicators
+
+**Healthy v15 Training @ 1M steps:**
+- Action Distribution: ~35% Flat, 15-25% Long, 40-50% Short
+- Avg Reward: Improving from -2800 → -700 (should approach 0 by 5M)
+- Max Episode Reward: Should see positive episodes (+1000 to +3700)
+- Mean Trades: ~100-200/episode (will decrease as agent becomes selective)
+- Win Rate: ~40-50% (should improve to >50% after 3M steps)
+
+**Warning Signs:**
+- Flat > 90%: Policy collapse - increase `ent_coef` or `trade_entry_bonus`
+- Reward not improving after 500K steps: Check reward scaling
+- Win rate < 40% after 2M steps: May need architecture changes
+- Mean Trades > 300: Over-trading, reduce `trade_entry_bonus`
+
+**Monitoring Commands:**
+```bash
+# Latest progress
+tail -50 models/agent/training_*.log
+
+# Action distribution trend
+grep "Action Distribution" models/agent/training_*.log | tail -20
+
+# Check for positive episodes
+grep "Recent Avg PnL" models/agent/training_*.log | grep -v "^-"
 ```

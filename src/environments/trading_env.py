@@ -60,12 +60,13 @@ class TradingEnv(gym.Env):
         lookback_4h: int = 12,
         spread_pips: float = 0.2,     # Razor/Raw spread
         slippage_pips: float = 0.5,   # Includes commission + slippage
-        fomo_penalty: float = 0.0,    # Disabled for stability
+        fomo_penalty: float = -1.0,   # v15: Meaningful penalty for missing moves (was 0.0)
         chop_penalty: float = 0.0,    # Disabled for stability
-        fomo_threshold_atr: float = 2.0,  # Only trigger on significant moves
+        fomo_threshold_atr: float = 1.5,  # v15: Trigger on >1.5x ATR moves (was 2.0)
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
         max_steps: int = 500,         # ~1 week for rapid regime cycling
-        reward_scaling: float = 0.01, # Reduced to 1.0 per 100 pips (was 0.5)
+        reward_scaling: float = 1.0,  # v15: 1.0 per 1 pip (was 0.01 = 1.0 per 100 pips)
+        trade_entry_bonus: float = 0.5,  # v15: Bonus for opening positions to encourage exploration
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
@@ -151,6 +152,7 @@ class TradingEnv(gym.Env):
         self.chop_threshold = chop_threshold
         self.max_steps = max_steps
         self.reward_scaling = reward_scaling  # Scale PnL to balance with penalties
+        self.trade_entry_bonus = trade_entry_bonus  # v15: Bonus for opening positions
 
         # Risk Management - Stop-Loss and Take-Profit
         self.sl_atr_multiplier = sl_atr_multiplier
@@ -218,7 +220,8 @@ class TradingEnv(gym.Env):
         # Multi-class (3 classes): [p_down, p_neutral, p_up, edge, confidence, uncertainty] = 6
         n_market_features = market_features.shape[1] if len(market_features.shape) > 1 else 5
         analyst_metrics_dim = 5 if num_classes == 2 else 6
-        obs_dim = context_dim + 3 + n_market_features + analyst_metrics_dim
+        # Added +2 for [dist_to_sl, dist_to_tp] to fix Blind Spot
+        obs_dim = context_dim + 3 + n_market_features + analyst_metrics_dim + 2
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -487,10 +490,43 @@ class TradingEnv(gym.Env):
         else:
             market_feat = np.zeros(5, dtype=np.float32)
 
-        # Combine all (all components now on similar scales)
-        obs = np.concatenate([context, position_state, market_feat, analyst_metrics])
+        # Combine all features
+        # [context (32), position (3), market (5), analyst (5), sl_tp (2)]
+        
+        # SL/TP Blind Spot Fix: Calculate normalized distance to expected SL/TP levels
+        dist_sl_norm = 0.0
+        dist_tp_norm = 0.0
+        
+        if self.position != 0 and len(self.market_features.shape) > 1:
+            atr = self.market_features[self.current_idx, 0]
+            if atr > 1e-8:
+                # Replicate logic from _check_stop_loss_take_profit
+                sl_pips = max((atr * self.sl_atr_multiplier) / 0.0001, 5.0)
+                tp_pips = max((atr * self.tp_atr_multiplier) / 0.0001, 5.0)
+                pip_value = 0.0001
+                
+                if self.position == 1: # Long
+                    sl_price = self.entry_price - sl_pips * pip_value
+                    tp_price = self.entry_price + tp_pips * pip_value
+                    # Normalize by ATR (e.g. 1.0 = current price is 1 ATR away from level)
+                    # For SL: Positive = Safe, Negative = Hit/Danger
+                    dist_sl_norm = (current_price - sl_price) / atr
+                    # For TP: Positive = Far, Negative = Hit/Close
+                    dist_tp_norm = (tp_price - current_price) / atr
+                else: # Short
+                    sl_price = self.entry_price + sl_pips * pip_value
+                    tp_price = self.entry_price - tp_pips * pip_value
+                    # For Short: SL is ABOVE, Price is BELOW
+                    dist_sl_norm = (sl_price - current_price) / atr
+                    dist_tp_norm = (current_price - tp_price) / atr
 
-        # Anti-Overfitting: Inject Gaussian Noise
+        obs = np.concatenate([
+            context,
+            position_state,
+            market_feat,
+            analyst_metrics,
+            np.array([dist_sl_norm, dist_tp_norm], dtype=np.float32)
+        ]) # Anti-Overfitting: Inject Gaussian Noise
         if self.noise_level > 0:
             noise = np.random.normal(0, self.noise_level, size=obs.shape).astype(np.float32)
             obs += noise
@@ -877,10 +913,11 @@ class TradingEnv(gym.Env):
                 self.total_pnl -= exec_cost
                 info['trade_opened'] = True
 
-                # CONFIDENCE BONUS: DISABLED
-                # Rewarding entries based on Analyst confidence (regardless of outcome)
-                # adds noise to the reward signal and can encourage overtrading.
-                # The agent should learn from actual PnL, not from Analyst confidence.
+                # v15 FIX: Trade entry bonus to encourage exploration
+                # Without this, every trade starts with negative reward (entry cost)
+                # which teaches the agent that trading is bad before it can learn profitability
+                reward += self.trade_entry_bonus
+                info['trade_entry_bonus'] = self.trade_entry_bonus
 
         elif direction == 2:  # Short
             if self.position == 1:  # Close long first
@@ -920,10 +957,11 @@ class TradingEnv(gym.Env):
                 self.total_pnl -= exec_cost
                 info['trade_opened'] = True
 
-                # CONFIDENCE BONUS: DISABLED
-                # Rewarding entries based on Analyst confidence (regardless of outcome)
-                # adds noise to the reward signal and can encourage overtrading.
-                # The agent should learn from actual PnL, not from Analyst confidence.
+                # v15 FIX: Trade entry bonus to encourage exploration
+                # Without this, every trade starts with negative reward (entry cost)
+                # which teaches the agent that trading is bad before it can learn profitability
+                reward += self.trade_entry_bonus
+                info['trade_entry_bonus'] = self.trade_entry_bonus
 
         # Continuous PnL feedback: reward based on CHANGE in unrealized PnL each step.
         # This prevents the "death spiral" where holding in chop accumulates penalties
