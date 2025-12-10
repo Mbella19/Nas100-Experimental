@@ -463,7 +463,12 @@ class TradingEnv(gym.Env):
         # CRITICAL FIX: Use floor for ATR to prevent division by near-zero
         atr_safe = max(atr, 1e-6)
         if self.position != 0:
-            entry_price_norm = (self.entry_price - current_price) / (atr_safe * 100)
+            # FIX: entry_price_norm should be POSITIVE when position is profitable
+            # Previously was inverted for Long positions (winning Long = negative value)
+            if self.position == 1:  # Long: positive when price goes UP (winning)
+                entry_price_norm = (current_price - self.entry_price) / (atr_safe * 100)
+            else:  # Short: positive when price goes DOWN (winning)
+                entry_price_norm = (self.entry_price - current_price) / (atr_safe * 100)
             # Clip to prevent extreme values
             entry_price_norm = np.clip(entry_price_norm, -10.0, 10.0)
             unrealized_pnl = self._calculate_unrealized_pnl()
@@ -606,7 +611,9 @@ class TradingEnv(gym.Env):
                 # Exit at SL level (not at the low - we don't know exact fill)
                 exit_price = sl_price
                 pnl_pips = -sl_pips_threshold * self.position_size
-                pnl = pnl_pips * 10  # $10 per pip per lot
+                # FIX: Keep PnL in PIPS (same unit as _calculate_unrealized_pnl)
+                # Previously multiplied by 10 (dollars) which broke reward calculation
+                pnl = pnl_pips
 
                 self.total_pnl += pnl
                 self.trades.append({
@@ -618,7 +625,7 @@ class TradingEnv(gym.Env):
                     'close_reason': 'stop_loss'
                 })
 
-                # Calculate final delta before reset
+                # Calculate final delta before reset (both in PIPS now)
                 final_delta = pnl - self.prev_unrealized_pnl
 
                 # Reset
@@ -638,7 +645,8 @@ class TradingEnv(gym.Env):
                 # Exit at TP level
                 exit_price = tp_price
                 pnl_pips = tp_pips_threshold * self.position_size
-                pnl = pnl_pips * 10
+                # FIX: Keep PnL in PIPS (same unit as _calculate_unrealized_pnl)
+                pnl = pnl_pips
 
                 self.total_pnl += pnl
                 self.trades.append({
@@ -650,7 +658,7 @@ class TradingEnv(gym.Env):
                     'close_reason': 'take_profit'
                 })
 
-                # Calculate final delta before reset
+                # Calculate final delta before reset (both in PIPS now)
                 final_delta = pnl - self.prev_unrealized_pnl
 
                 self.position = 0
@@ -674,7 +682,8 @@ class TradingEnv(gym.Env):
                 # Exit at SL level
                 exit_price = sl_price
                 pnl_pips = -sl_pips_threshold * self.position_size
-                pnl = pnl_pips * 10
+                # FIX: Keep PnL in PIPS (same unit as _calculate_unrealized_pnl)
+                pnl = pnl_pips
 
                 self.total_pnl += pnl
                 self.trades.append({
@@ -686,7 +695,7 @@ class TradingEnv(gym.Env):
                     'close_reason': 'stop_loss'
                 })
 
-                # Calculate final delta before reset
+                # Calculate final delta before reset (both in PIPS now)
                 final_delta = pnl - self.prev_unrealized_pnl
 
                 self.position = 0
@@ -705,7 +714,8 @@ class TradingEnv(gym.Env):
                 # Exit at TP level
                 exit_price = tp_price
                 pnl_pips = tp_pips_threshold * self.position_size
-                pnl = pnl_pips * 10
+                # FIX: Keep PnL in PIPS (same unit as _calculate_unrealized_pnl)
+                pnl = pnl_pips
 
                 self.total_pnl += pnl
                 self.trades.append({
@@ -717,7 +727,7 @@ class TradingEnv(gym.Env):
                     'close_reason': 'take_profit'
                 })
 
-                # Calculate final delta before reset
+                # Calculate final delta before reset (both in PIPS now)
                 final_delta = pnl - self.prev_unrealized_pnl
 
                 self.position = 0

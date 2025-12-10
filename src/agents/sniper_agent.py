@@ -213,7 +213,8 @@ class SniperAgent:
         eval_freq: int = 10_000,
         save_path: Optional[str] = None,
         callbacks: Optional[list] = None,
-        callback: Optional[BaseCallback] = None
+        callback: Optional[BaseCallback] = None,
+        reset_num_timesteps: bool = True
     ) -> Dict[str, Any]:
         """
         Train the agent.
@@ -225,6 +226,7 @@ class SniperAgent:
             save_path: Path to save best model
             callbacks: Additional callbacks (list)
             callback: Single callback (for convenience)
+            reset_num_timesteps: Whether to reset the current timestep count (False for resuming)
 
         Returns:
             Training info dictionary
@@ -267,7 +269,8 @@ class SniperAgent:
         self.model.learn(
             total_timesteps=total_timesteps,
             callback=callback_list,
-            progress_bar=True
+            progress_bar=True,
+            reset_num_timesteps=reset_num_timesteps
         )
 
         # Save final model

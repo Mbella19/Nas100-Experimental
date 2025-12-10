@@ -188,18 +188,18 @@ class TradingConfig:
     max_position_size: float = 5.0
     
     # Reward Params
-    # FIX v15: Previous reward_scaling (0.1) was too weak - trades didn't produce
-    # meaningful learning signal. FOMO penalty (-0.05) was too small to matter.
-    # New values encourage exploration while still being proportional to PnL.
-    fomo_penalty: float = -1.0    # Meaningful penalty for missing moves (was -0.05)
-    chop_penalty: float = 0.0     # Disabled
-    fomo_threshold_atr: float = 1.5  # Trigger on >1.5x ATR moves (was 2.0)
+    # FIX v16: After fixing mixed PnL units bug (pips vs dollars) and inverted entry_price_norm,
+    # higher reward scaling is now safe because the reward signal is consistent.
+    # Previous v15 values (1.0, -1.0, 0.5) caused random trading because observation was inverted.
+    fomo_penalty: float = -0.5    # Moderate penalty for missing high-momentum moves
+    chop_penalty: float = 0.0     # Disabled (can cause over-penalization in legitimate ranging trades)
+    fomo_threshold_atr: float = 4.0  # Trigger on >1.5x ATR moves
     chop_threshold: float = 80.0     # Only extreme chop triggers penalty
-    reward_scaling: float = 1.0     # 1.0 per 1 pip (was 0.1 = 1.0 per 10 pips)
+    reward_scaling: float = 0.1     # 1.0 reward per 1 pip (now safe after fixing unit bugs)
 
     # Trade entry bonus: Offsets entry cost to encourage exploration
-    # Without this, every trade starts negative (spread + slippage) discouraging action
-    trade_entry_bonus: float = 0.5  # Bonus for opening a position
+    # Lower than v15 (0.5) to avoid random trading, but enough to offset spread+slippage
+    trade_entry_bonus: float = 0.01  # Moderate bonus (~half of entry cost)
     
     # These are mostly unused now but keep for compatibility if needed
     use_stop_loss: bool = True
@@ -210,7 +210,7 @@ class TradingConfig:
     initial_balance: float = 10000.0
     
     # Validation
-    noise_level: float = 0.05  # Reduced to 2% to encourage more activity (was 5%)
+    noise_level: float = 0.01  # Reduced to 2% to encourage more activity (was 5%)
 
 
 @dataclass
@@ -220,14 +220,14 @@ class AgentConfig:
     # PPO hyperparameters (from CLAUDE.md spec)
     # FIX v15: Previous ent_coef (0.01) caused rapid policy collapse to flat.
     # For a 12-action discrete space, higher entropy is needed to maintain exploration.
-    learning_rate: float = 3e-4  # Higher initial LR for faster learning (was 1e-4)
+    learning_rate: float = 1e-4  # Higher initial LR for faster learning (was 1e-4)
     n_steps: int = 2048         # Timesteps per update
     batch_size: int = 256       # Minibatch size
     n_epochs: int = 10          # Reduced to prevent overfitting (was 20)
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.1        # HIGH entropy to force exploration (was 0.01)
+    ent_coef: float = 0.01        # HIGH entropy to force exploration (was 0.01)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 

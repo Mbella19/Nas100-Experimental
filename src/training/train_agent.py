@@ -663,28 +663,27 @@ def create_trading_env(
     Returns:
         TradingEnv instance
     """
-    # Default configuration (matches config/settings.py v15 fixes)
-    # FIX v15: Previous defaults (fomo=0.0, reward_scaling=0.01) caused flat convergence
+    # Default configuration (matches config/settings.py v16 fixes)
+    # FIX v16: After fixing mixed PnL units and inverted entry_price_norm,
+    # these defaults now produce correct reward signals
     spread_pips = 0.2       # Razor/Raw spread
     slippage_pips = 0.5     # Includes commission + slippage
-    fomo_penalty = -1.0     # Meaningful penalty for missing moves (was 0.0)
+    fomo_penalty = -0.5     # Moderate penalty for missing high-momentum moves
     chop_penalty = 0.0      # Disabled
-    fomo_threshold_atr = 1.5  # Trigger on >1.5x ATR moves (was 2.0)
+    fomo_threshold_atr = 4.0  # Trigger on >1.5x ATR moves
     chop_threshold = 80.0   # Only extreme chop triggers penalty
     max_steps = 500
-    reward_scaling = 1.0    # 1.0 per 1 pip (was 0.01 = 1.0 per 100 pips)
+    reward_scaling = 0.1    # 1.0 reward per 1 pip (safe after fixing unit bugs)
     context_dim = 64
-    trade_entry_bonus = 0.5  # Bonus for opening positions (encourages exploration)
-    
+    trade_entry_bonus = 0.01  # Moderate bonus (~half of entry cost)
+
     # Risk Management defaults
-    sl_atr_multiplier = 1.5
+    sl_atr_multiplier = 1.0
     tp_atr_multiplier = 3.0
     use_stop_loss = True
-    use_stop_loss = True
     use_take_profit = True
-    
+
     # Volatility Sizing
-    volatility_sizing = True
     volatility_sizing = True
     risk_pips_target = 15.0
     
@@ -745,7 +744,7 @@ def create_trading_env(
         reward_scaling=reward_scaling,  # v15 FIX: Use local variable, not config directly
         trade_entry_bonus=trade_entry_bonus,  # v15: Exploration bonus
         device=device,
-        noise_level=getattr(config, 'noise_level', 0.0) if config else 0.0,
+        noise_level=getattr(config, 'noise_level', 0.01) if config else 0.0,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
         # Risk Management
@@ -984,14 +983,15 @@ def train_agent(
         logger.info(f"To enable sequential context, run: python src/training/precompute_analyst.py")
 
     # Create training environment
-    # FIX: If using regime sampling, we MUST use synthetic timestamps for visualization
-    # Real timestamps will jump (e.g. 2022 -> 2018), causing the chart to look broken/gap-filled.
-    # Synthetic timestamps ensure a continuous, smooth chart for the agent's experience.
-    # regime sampling is DISABLED to prevent overfitting to artificial trend distributions
-    use_regime_sampling_train = False # Explicitly define this for clarity
+    # FIX: ENABLE regime sampling to balance training across market regimes
+    # Without this, agent sees 61% Ranging data and learns "stay flat" as default
+    # Note: Use synthetic timestamps for visualization when regime sampling is enabled
+    # to prevent chart gaps from timestamp jumps (e.g. 2022 -> 2018)
+    use_regime_sampling_train = True  # ENABLED: Critical for balanced directional learning
     viz_timestamps = train_timestamps
     if use_regime_sampling_train:
-        logger.info("Regime sampling enabled: Using SYNTHETIC timestamps for visualization to prevent chart gaps.")
+        logger.info("Regime sampling ENABLED: Agent will see 33% Bullish, 33% Ranging, 33% Bearish")
+        logger.info("Using SYNTHETIC timestamps for visualization to prevent chart gaps.")
         viz_timestamps = None
 
     train_env = create_trading_env(
@@ -1032,12 +1032,30 @@ def train_agent(
     eval_env = Monitor(eval_env)
 
     # Create agent
+    reset_timesteps = True
+    remaining_timesteps = total_timesteps
+
     if resume_path and Path(resume_path).exists():
         logger.info(f"Resuming PPO agent from checkpoint: {resume_path}")
         agent = SniperAgent.load(resume_path, env=train_env, device=device)
+        
+        # Calculate remaining steps
+        current_timesteps = agent.model.num_timesteps
+        # Ensure we run for at least 10k steps if completed or close to completion,
+        # otherwise run until total_timesteps is reached.
+        # If user wants to EXTEND training, they should increase total_timesteps in config.
+        remaining_timesteps = max(10000, total_timesteps - current_timesteps)
+        reset_timesteps = False
+        
+        logger.info(f"Resumed from step {current_timesteps:,}. Target: {total_timesteps:,}.")
+        logger.info(f"Remaining timesteps: {remaining_timesteps:,}")
+        logger.info("Learning Rate Schedule will CONTINUE from current step (NOT reset).")
+        
     else:
         logger.info("Creating PPO agent...")
         agent = create_agent(train_env, config.agent)
+        remaining_timesteps = total_timesteps
+        reset_timesteps = True
 
     # Create training logger callback
     training_callback = AgentTrainingLogger(
@@ -1048,15 +1066,16 @@ def train_agent(
     )
 
     # Train
-    logger.info(f"Starting training for {total_timesteps:,} timesteps...")
+    logger.info(f"Starting training for {remaining_timesteps:,} timesteps...")
     logger.info("-" * 70)
 
     training_info = agent.train(
-        total_timesteps=total_timesteps,
+        total_timesteps=remaining_timesteps,
         eval_env=eval_env,
         eval_freq=10_000,
         save_path=save_path,
-        callback=training_callback
+        callback=training_callback,
+        reset_num_timesteps=reset_timesteps
     )
 
     # Get metrics from callback
