@@ -245,7 +245,7 @@ class TradingConfig:
     use_take_profit: bool = True
     
     # Environment settings
-    max_steps_per_episode: int = 500    # Reduced to ~1 week (was 2000) for rapid regime cycling
+    max_steps_per_episode: int = 1500   # Increased for min_hold=24 (~62 trades/episode)
     initial_balance: float = 10000.0
     
     # Validation
@@ -263,9 +263,9 @@ class AgentConfig:
     # PPO hyperparameters (from CLAUDE.md spec)
     # FIX v15: Previous ent_coef (0.01) caused rapid policy collapse to flat.
     # For a 12-action discrete space, higher entropy is needed to maintain exploration.
-    learning_rate: float = 1e-4  # Higher initial LR for faster learning (was 1e-4)
-    n_steps: int = 2048         # Timesteps per update
-    batch_size: int = 256       # Minibatch size
+    learning_rate: float = 2e-4  # Increased for batch_size=2048 (stable gradients)
+    n_steps: int = 8192         # Increased for min_hold=24 (need ~300+ trades per update)
+    batch_size: int = 2048      # Larger minibatch for 8192 n_steps
     n_epochs: int = 10          # Reduced to prevent overfitting (was 20)
     # Higher gamma reduces discounting, helping PPO value longer holds.
     # v16: Increased to 0.999 for sparse exit-only rewards (agent must plan ahead)
