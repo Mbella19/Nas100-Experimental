@@ -2,17 +2,23 @@
 PPO Sniper Agent wrapper using Stable Baselines 3.
 
 Features:
-- MPS device support with CPU fallback
+- CPU-only PPO by default (stable SB3 training)
 - Memory-efficient callbacks
 - Training and inference methods
 - Model saving/loading
 """
 
+import os
 import torch
 import numpy as np
 from typing import Optional, Dict, Any, Callable
 from pathlib import Path
 import gc
+
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    str(Path(__file__).resolve().parents[2] / ".mplconfig"),
+)
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
@@ -36,8 +42,11 @@ class MemoryCleanupCallback(BaseCallback):
     def _on_step(self) -> bool:
         if self.n_calls % self.cleanup_freq == 0:
             gc.collect()
-            if torch.backends.mps.is_available():
+            device_type = getattr(getattr(self.model, "device", None), "type", None)
+            if device_type == "mps" and torch.backends.mps.is_available():
                 torch.mps.empty_cache()
+            elif device_type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if self.verbose > 0:
                 print(f"Memory cleanup at step {self.n_calls}")
         return True
@@ -87,7 +96,7 @@ class SniperAgent:
     PPO-based Sniper Agent for the trading environment.
 
     Wraps Stable Baselines 3 PPO with:
-    - MPS/CPU device selection
+    - CPU device selection (default)
     - Custom network architecture
     - Memory-efficient training
     - Evaluation and inference methods
@@ -107,7 +116,7 @@ class SniperAgent:
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         net_arch: Optional[list] = None,
-        device: Optional[str] = None,
+        device: Optional[str | torch.device] = None,
         verbose: int = 1,
         seed: Optional[int] = None
     ):
@@ -145,6 +154,13 @@ class SniperAgent:
         # Device selection with fallback
         if device is None:
             device = self._select_device()
+        else:
+            # Normalize to string for consistent handling.
+            device_type = device if isinstance(device, str) else device.type
+            if device_type != "cpu":
+                if verbose > 0:
+                    print(f"Overriding PPO device {device_type} -> cpu")
+                device = "cpu"
 
         # Create PPO model
         try:
@@ -198,13 +214,8 @@ class SniperAgent:
 
     def _select_device(self) -> str:
         """Select the best available device."""
-        # Note: SB3 has limited MPS support, CPU is often more stable
-        if torch.backends.mps.is_available():
-            # Try MPS, but be prepared to fall back
-            return 'mps'
-        elif torch.cuda.is_available():
-            return 'cuda'
-        return 'cpu'
+        # NOTE: SB3 PPO is most stable on CPU (especially on Apple Silicon).
+        return "cpu"
 
     def train(
         self,
@@ -231,6 +242,20 @@ class SniperAgent:
         Returns:
             Training info dictionary
         """
+        ppo_log_dir = None
+        if save_path:
+            from stable_baselines3.common.logger import configure
+            from datetime import datetime
+
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ppo_log_dir = Path(save_path) / "ppo_logs" / run_id
+            ppo_log_dir.mkdir(parents=True, exist_ok=True)
+            # Persist PPO training metrics (incl. loss) for offline inspection.
+            # `progress.csv` contains fields like: train/loss, train/value_loss, rollout/ep_rew_mean, etc.
+            self.model.set_logger(configure(str(ppo_log_dir), ["csv", "log"]))
+            if self.verbose > 0:
+                print(f"SB3 PPO logs (incl. loss): {ppo_log_dir}")
+
         # Build callback list
         callback_list = [
             MemoryCleanupCallback(cleanup_freq=5000, verbose=self.verbose),
@@ -239,7 +264,8 @@ class SniperAgent:
 
         # Add Checkpoint Callback (Save every 100k steps)
         if save_path:
-            checkpoint_path = Path(save_path).parent / "checkpoints"
+            checkpoint_path = Path(save_path) / "checkpoints"
+            checkpoint_path.mkdir(parents=True, exist_ok=True)
             callback_list.append(CheckpointCallback(
                 save_freq=100_000,
                 save_path=str(checkpoint_path),
@@ -279,7 +305,8 @@ class SniperAgent:
 
         return {
             'total_timesteps': total_timesteps,
-            'device': self.device
+            'device': self.device,
+            'ppo_log_dir': str(ppo_log_dir) if ppo_log_dir is not None else None,
         }
 
     def predict(
@@ -450,7 +477,7 @@ class SniperAgent:
         cls,
         path: str | Path,
         env: gym.Env,
-        device: Optional[str] = None
+        device: Optional[str | torch.device] = None
     ) -> 'SniperAgent':
         """
         Load a saved model.
@@ -478,7 +505,8 @@ class SniperAgent:
 
 def create_agent(
     env: gym.Env,
-    config: Optional[object] = None
+    config: Optional[object] = None,
+    device: Optional[str | torch.device] = None
 ) -> SniperAgent:
     """
     Factory function to create SniperAgent with config.
@@ -491,7 +519,7 @@ def create_agent(
         SniperAgent instance
     """
     if config is None:
-        return SniperAgent(env)
+        return SniperAgent(env, device=device)
 
     return SniperAgent(
         env=env,
@@ -505,5 +533,6 @@ def create_agent(
         ent_coef=config.ent_coef,
         vf_coef=config.vf_coef,
         max_grad_norm=config.max_grad_norm,
-        net_arch=config.net_arch if hasattr(config, 'net_arch') else None
+        net_arch=config.net_arch if hasattr(config, 'net_arch') else None,
+        device=device
     )

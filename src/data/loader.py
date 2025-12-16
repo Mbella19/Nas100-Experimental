@@ -1,5 +1,5 @@
 """
-Data loading module for OHLCV data.
+Data loading module for OHLC data.
 
 Handles CSV loading with validation and memory-efficient processing.
 """
@@ -12,15 +12,49 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Required columns for OHLCV data (with aliases)
+# Required columns for OHLC data (with aliases)
 REQUIRED_COLUMNS = ['open', 'high', 'low', 'close']
 COLUMN_ALIASES = {
     'timestamp': 'datetime',
     'time': 'datetime',
     'date': 'datetime',
-    'tick_volume': 'volume',
-    'vol': 'volume'
 }
+
+DATETIME_COLUMNS = ('datetime', 'timestamp', 'time', 'date')
+
+
+def _select_ohlc_usecols(path: Path) -> List[str]:
+    """
+    Select only the datetime + OHLC columns to load.
+
+    This intentionally ignores any other columns present in the CSV.
+    """
+    header = pd.read_csv(path, nrows=0)
+    cols = list(header.columns)
+    if not cols:
+        raise ValueError(f"No columns found in CSV: {path}")
+
+    lower_map = {str(c).strip().lower(): c for c in cols}
+
+    # Prefer explicit datetime-like columns; fall back to first column.
+    dt_col = None
+    for candidate in DATETIME_COLUMNS:
+        if candidate in lower_map:
+            dt_col = lower_map[candidate]
+            break
+    if dt_col is None:
+        dt_col = cols[0]
+
+    # Required OHLC columns (case-insensitive)
+    missing = [c for c in REQUIRED_COLUMNS if c not in lower_map]
+    if missing:
+        raise ValueError(f"Missing required columns: {set(missing)}")
+
+    ohlc_cols = [lower_map[c] for c in REQUIRED_COLUMNS]
+    usecols = [dt_col, *ohlc_cols]
+
+    # Deduplicate while preserving order
+    return list(dict.fromkeys(usecols))
 
 
 def validate_ohlcv(df: pd.DataFrame) -> bool:
@@ -63,7 +97,7 @@ def load_ohlcv(
     validate: bool = True
 ) -> pd.DataFrame:
     """
-    Load OHLCV data from CSV file.
+    Load OHLC data from CSV file.
 
     Args:
         path: Path to CSV file
@@ -72,7 +106,7 @@ def load_ohlcv(
         validate: Whether to validate the data
 
     Returns:
-        DataFrame with datetime index and float32 OHLCV columns
+        DataFrame with datetime index and float32 OHLC columns
     """
     path = Path(path)
     if not path.exists():
@@ -80,23 +114,35 @@ def load_ohlcv(
 
     logger.info(f"Loading OHLCV data from {path}")
 
+    usecols = _select_ohlc_usecols(path)
+
     if chunk_size:
         # Memory-efficient chunked loading
-        df = _load_chunked(path, datetime_format, chunk_size)
+        df = _load_chunked(path, datetime_format, chunk_size, usecols=usecols)
     else:
         # Standard loading
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, usecols=usecols)
 
     # Normalize column names to lowercase
     df.columns = df.columns.str.lower()
 
-    # Apply column aliases (timestamp -> datetime, tick_volume -> volume)
+    # Apply column aliases (timestamp/time/date -> datetime)
     df.rename(columns=COLUMN_ALIASES, inplace=True)
 
     # Parse datetime and set as index
+    def _parse_datetime(series: pd.Series) -> pd.Series:
+        """Parse datetime with optional format."""
+        fmt = datetime_format
+        if fmt is None:
+            return pd.to_datetime(series, utc=True, errors='coerce')
+        fmt_str = str(fmt).lower()
+        if fmt_str in ("iso8601", "auto", "auto-detect", "autodetect"):
+            return pd.to_datetime(series, utc=True, errors='coerce')
+        return pd.to_datetime(series, format=fmt, utc=True, errors='coerce')
+
     if 'datetime' in df.columns:
         # Handle timezone-aware timestamps
-        df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+        df['datetime'] = _parse_datetime(df['datetime'])
         df['datetime'] = df['datetime'].dt.tz_localize(None)  # Remove timezone for simplicity
         df.set_index('datetime', inplace=True)
     elif df.index.name == 'datetime' or isinstance(df.index, pd.DatetimeIndex):
@@ -104,7 +150,7 @@ def load_ohlcv(
     else:
         # Try first column as datetime
         first_col = df.columns[0]
-        df[first_col] = pd.to_datetime(df[first_col], utc=True)
+        df[first_col] = _parse_datetime(df[first_col])
         df[first_col] = df[first_col].dt.tz_localize(None)
         df.set_index(first_col, inplace=True)
         df.index.name = 'datetime'
@@ -113,7 +159,7 @@ def load_ohlcv(
     df.sort_index(inplace=True)
 
     # Convert to float32 for memory efficiency (CRITICAL for M2)
-    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+    numeric_cols = ['open', 'high', 'low', 'close']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = df[col].astype(np.float32)
@@ -130,12 +176,12 @@ def load_ohlcv(
 def _load_chunked(
     path: Path,
     datetime_format: str,
-    chunk_size: int
+    chunk_size: int,
+    usecols: Optional[List[str]] = None
 ) -> pd.DataFrame:
     """Load CSV in chunks and concatenate."""
     chunks = []
-    for chunk in pd.read_csv(path, chunksize=chunk_size):
-        chunk.columns = chunk.columns.str.lower()
+    for chunk in pd.read_csv(path, chunksize=chunk_size, usecols=usecols):
         chunks.append(chunk)
 
     return pd.concat(chunks, ignore_index=True)
@@ -146,20 +192,21 @@ def load_ohlcv_generator(
     chunk_size: int = 100_000
 ) -> Generator[pd.DataFrame, None, None]:
     """
-    Generator for memory-efficient streaming of large OHLCV files.
+    Generator for memory-efficient streaming of large OHLC files.
 
     Yields:
         DataFrame chunks
     """
     path = Path(path)
-    for chunk in pd.read_csv(path, chunksize=chunk_size):
+    usecols = _select_ohlc_usecols(path)
+    for chunk in pd.read_csv(path, chunksize=chunk_size, usecols=usecols):
         chunk.columns = chunk.columns.str.lower()
         if 'datetime' in chunk.columns:
             chunk['datetime'] = pd.to_datetime(chunk['datetime'])
             chunk.set_index('datetime', inplace=True)
 
         # Convert to float32
-        for col in ['open', 'high', 'low', 'close', 'volume']:
+        for col in ['open', 'high', 'low', 'close']:
             if col in chunk.columns:
                 chunk[col] = chunk[col].astype(np.float32)
 

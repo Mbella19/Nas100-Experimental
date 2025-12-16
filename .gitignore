@@ -48,12 +48,6 @@ models/
 *.zip
 *.pkl
 
-# Node modules
-node_modules/
-frontend/node_modules/
-frontend/.next/
-.next/
-
 # Results and Logs
 results/
 *.log

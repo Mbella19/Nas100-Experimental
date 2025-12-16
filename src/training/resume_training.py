@@ -120,8 +120,11 @@ class MemoryCleanupCallback(BaseCallback):
     def _on_step(self) -> bool:
         if self.n_calls % self.cleanup_freq == 0:
             gc.collect()
-            if torch.backends.mps.is_available():
+            device_type = getattr(getattr(self.model, "device", None), "type", None)
+            if device_type == "mps" and torch.backends.mps.is_available():
                 torch.mps.empty_cache()
+            elif device_type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if self.verbose > 0:
                 print(f"Memory cleanup at step {self.n_calls}")
         return True
@@ -131,7 +134,7 @@ def resume_training():
     # ... (rest of the function setup) ...
     # (I will insert the logger instantiation and usage below)
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
     # 1. Load Pre-processed Data (Parquet)

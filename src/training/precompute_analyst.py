@@ -24,6 +24,7 @@ import torch
 import pandas as pd
 import gc
 from tqdm import tqdm
+from typing import Optional, Tuple, List
 
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
@@ -31,7 +32,6 @@ sys.path.insert(0, str(project_root))
 
 from config.settings import Config, get_device, clear_memory
 from src.models.analyst import load_analyst
-from src.data.features import get_feature_columns
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,13 +42,13 @@ logger = logging.getLogger(__name__)
 
 def precompute_analyst_outputs(
     analyst_path: str,
+    df_5m: pd.DataFrame,
     df_15m: pd.DataFrame,
-    df_1h: pd.DataFrame,
-    df_4h: pd.DataFrame,
+    df_45m: pd.DataFrame,
     feature_cols: list,
-    lookback_15m: int = 48,
-    lookback_1h: int = 24,
-    lookback_4h: int = 12,
+    lookback_5m: int = 48,
+    lookback_15m: int = 16,
+    lookback_45m: int = 6,
     device: torch.device = None,
     batch_size: int = 64,
     save_path: str = None,
@@ -60,7 +60,7 @@ def precompute_analyst_outputs(
     
     Args:
         analyst_path: Path to trained Analyst model
-        df_15m, df_1h, df_4h: Multi-timeframe DataFrames
+        df_5m, df_15m, df_45m: Multi-timeframe DataFrames
         feature_cols: Feature columns to use
         lookback_*: Lookback windows per timeframe
         device: Torch device
@@ -73,78 +73,78 @@ def precompute_analyst_outputs(
     if device is None:
         device = get_device()
     
-    # Load Analyst model
+    # Load Analyst model (TCN uses true timeframe keys)
     feature_dims = {
+        '5m': len(feature_cols),
         '15m': len(feature_cols),
-        '1h': len(feature_cols),
-        '4h': len(feature_cols)
+        '45m': len(feature_cols)
     }
     analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
     analyst.eval()
     
     # Extract features as numpy arrays
+    features_5m = df_5m[feature_cols].values.astype(np.float32)
     features_15m = df_15m[feature_cols].values.astype(np.float32)
-    features_1h = df_1h[feature_cols].values.astype(np.float32)
-    features_4h = df_4h[feature_cols].values.astype(np.float32)
+    features_45m = df_45m[feature_cols].values.astype(np.float32)
 
     # Get close prices for reference
-    close_prices = df_15m['close'].values.astype(np.float32)
+    close_prices = df_5m['close'].values.astype(np.float32)
 
     # FIXED: Subsampling factors for multi-timeframe alignment
-    # 1H data is aligned to 15m index, so we subsample every 4th bar
-    # 4H data is aligned to 15m index, so we subsample every 16th bar
-    subsample_1h = 4
-    subsample_4h = 16
+    # 15m data is aligned to 5m index, so we subsample every 3rd bar
+    # 45m data is aligned to 5m index, so we subsample every 9th bar
+    subsample_15m = 3
+    subsample_45m = 9
 
     # FIXED: Calculate valid start index accounting for subsampling
-    # Need enough bars for: 15m lookback, 1H lookback*4, 4H lookback*16
+    # Need enough bars for: 5m lookback, 15m lookback*3, 45m lookback*9
     start_idx = max(
-        lookback_15m,
-        (lookback_1h - 1) * subsample_1h + 1,  # For 24 1H candles: need 93 bars
-        (lookback_4h - 1) * subsample_4h + 1   # For 12 4H candles: need 177 bars
+        lookback_5m,
+        (lookback_15m - 1) * subsample_15m + 1,  # For 16 15m candles: need 46 bars
+        (lookback_45m - 1) * subsample_45m + 1   # For 6 45m candles: need 46 bars
     )
-    n_samples = len(features_15m) - start_idx
+    n_samples = len(features_5m) - start_idx
 
     logger.info(f"Pre-computing Analyst outputs for {n_samples:,} timesteps...")
     logger.info(f"Start index: {start_idx} (after lookback warmup with subsampling)")
-    logger.info(f"Subsampling: 1H every {subsample_1h} bars, 4H every {subsample_4h} bars")
+    logger.info(f"Subsampling: 15m every {subsample_15m} bars, 45m every {subsample_45m} bars")
 
     # Prepare windowed data (pre-window for each index)
     # This creates [n_samples, lookback, features] arrays
     logger.info("Creating windowed data arrays...")
 
+    data_5m = np.zeros((n_samples, lookback_5m, len(feature_cols)), dtype=np.float32)
     data_15m = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
-    data_1h = np.zeros((n_samples, lookback_1h, len(feature_cols)), dtype=np.float32)
-    data_4h = np.zeros((n_samples, lookback_4h, len(feature_cols)), dtype=np.float32)
+    data_45m = np.zeros((n_samples, lookback_45m, len(feature_cols)), dtype=np.float32)
 
     for i in range(n_samples):
         idx = start_idx + i
 
-        # 15m: direct slicing (include current candle)
-        data_15m[i] = features_15m[idx - lookback_15m + 1:idx + 1]
+        # 5m: direct slicing (include current candle)
+        data_5m[i] = features_5m[idx - lookback_5m + 1:idx + 1]
 
-        # FIXED: 1H - subsample every 4th bar, including current candle
-        idx_range_1h = list(range(
-            idx - (lookback_1h - 1) * subsample_1h,
+        # FIXED: 15m - subsample every 3rd bar, including current candle
+        idx_range_15m = list(range(
+            idx - (lookback_15m - 1) * subsample_15m,
             idx + 1,
-            subsample_1h
+            subsample_15m
         ))
-        data_1h[i] = features_1h[idx_range_1h]
+        data_15m[i] = features_15m[idx_range_15m]
 
-        # FIXED: 4H - subsample every 16th bar, including current candle
-        idx_range_4h = list(range(
-            idx - (lookback_4h - 1) * subsample_4h,
+        # FIXED: 45m - subsample every 9th bar, including current candle
+        idx_range_45m = list(range(
+            idx - (lookback_45m - 1) * subsample_45m,
             idx + 1,
-            subsample_4h
+            subsample_45m
         ))
-        data_4h[i] = features_4h[idx_range_4h]
+        data_45m[i] = features_45m[idx_range_45m]
     
-    logger.info(f"Windowed data shapes: 15m={data_15m.shape}, 1h={data_1h.shape}, 4h={data_4h.shape}")
+    logger.info(f"Windowed data shapes: 5m={data_5m.shape}, 15m={data_15m.shape}, 45m={data_45m.shape}")
     
     # Run Analyst in batches (SEQUENTIALLY - order matters for cumulative context)
     all_contexts = []
     all_probs = []
-    all_activations = {'15m': [], '1h': [], '4h': []}
+    all_activations = {'5m': [], '15m': [], '45m': []}
     
     n_batches = (n_samples + batch_size - 1) // batch_size
     
@@ -154,34 +154,32 @@ def precompute_analyst_outputs(
             end_i = min(start_i + batch_size, n_samples)
             
             # Get batch data
+            batch_5m = torch.tensor(data_5m[start_i:end_i], device=device)
             batch_15m = torch.tensor(data_15m[start_i:end_i], device=device)
-            batch_1h = torch.tensor(data_1h[start_i:end_i], device=device)
-            batch_4h = torch.tensor(data_4h[start_i:end_i], device=device)
+            batch_45m = torch.tensor(data_45m[start_i:end_i], device=device)
             
             # Get Analyst outputs (including activations for visualization)
             if hasattr(analyst, 'get_activations'):
-                context, activations = analyst.get_activations(batch_15m, batch_1h, batch_4h)
+                context, activations = analyst.get_activations(batch_5m, batch_15m, batch_45m)
                 
-                # Get probs separately (or modify get_activations to return them too, but this is cleaner for now)
-                # For efficiency, we can just call forward if we modify it, but let's stick to the plan
-                # Actually, let's just get probs from forward to avoid double computation if possible
-                # But TCN is fast. Let's just call get_probabilities separately or rely on forward.
-                # Wait, get_activations calls _encode_and_fuse. get_probabilities calls forward which calls _encode_and_fuse.
-                # To avoid double compute, let's just use forward if we can, but forward doesn't return activations easily without flag.
-                # Let's use the new get_activations and then get probs.
-                
-                _, probs = analyst.get_probabilities(batch_15m, batch_1h, batch_4h)
+                # Get probs separately
+                res = analyst.get_probabilities(batch_5m, batch_15m, batch_45m)
+
+                if isinstance(res, (tuple, list)) and len(res) == 3:
+                    _, probs, _ = res
+                else:
+                    _, probs = res
                 
                 for k in all_activations:
                     all_activations[k].append(activations[k].cpu().numpy())
             elif hasattr(analyst, 'get_probabilities'):
-                result = analyst.get_probabilities(batch_15m, batch_1h, batch_4h)
+                result = analyst.get_probabilities(batch_5m, batch_15m, batch_45m)
                 if len(result) == 3:
                     context, probs, _ = result
                 else:
                     context, probs = result
             else:
-                context = analyst.get_context(batch_15m, batch_1h, batch_4h)
+                context = analyst.get_context(batch_5m, batch_15m, batch_45m)
                 # Dummy probs
                 probs = torch.ones(len(context), 3, device=device) / 3
             
@@ -189,7 +187,7 @@ def precompute_analyst_outputs(
             all_probs.append(probs.cpu().numpy())
             
             # Memory cleanup
-            del batch_15m, batch_1h, batch_4h, context, probs
+            del batch_5m, batch_15m, batch_45m, context, probs
             if batch_idx % 50 == 0:
                 if torch.backends.mps.is_available():
                     torch.mps.empty_cache()
@@ -200,9 +198,9 @@ def precompute_analyst_outputs(
     probs = np.vstack(all_probs).astype(np.float32)
     
     # Combine activations
+    activations_5m = np.vstack(all_activations['5m']).astype(np.float32) if all_activations['5m'] else None
     activations_15m = np.vstack(all_activations['15m']).astype(np.float32) if all_activations['15m'] else None
-    activations_1h = np.vstack(all_activations['1h']).astype(np.float32) if all_activations['1h'] else None
-    activations_4h = np.vstack(all_activations['4h']).astype(np.float32) if all_activations['4h'] else None
+    activations_45m = np.vstack(all_activations['45m']).astype(np.float32) if all_activations['45m'] else None
     
     logger.info(f"Final shapes: contexts={contexts.shape}, probs={probs.shape}")
     
@@ -212,9 +210,9 @@ def precompute_analyst_outputs(
         'probs': probs,
         'close_prices': close_prices[start_idx:],
         'start_idx': start_idx,
+        'lookback_5m': lookback_5m,
         'lookback_15m': lookback_15m,
-        'lookback_1h': lookback_1h,
-        'lookback_4h': lookback_4h,
+        'lookback_45m': lookback_45m,
         'n_samples': n_samples,
         'feature_cols': feature_cols,
     }
@@ -227,14 +225,14 @@ def precompute_analyst_outputs(
             save_path,
             contexts=contexts,
             probs=probs,
+            activations_5m=activations_5m,
             activations_15m=activations_15m,
-            activations_1h=activations_1h,
-            activations_4h=activations_4h,
+            activations_45m=activations_45m,
             close_prices=close_prices[start_idx:],
             start_idx=start_idx,
+            lookback_5m=lookback_5m,
             lookback_15m=lookback_15m,
-            lookback_1h=lookback_1h,
-            lookback_4h=lookback_4h,
+            lookback_45m=lookback_45m,
         )
         logger.info(f"Saved cached Analyst outputs to: {save_path}")
     
@@ -255,14 +253,14 @@ def load_cached_analyst_outputs(cache_path: str) -> dict:
     return {
         'contexts': data['contexts'],
         'probs': data['probs'],
+        'activations_5m': data.get('activations_5m'),
         'activations_15m': data.get('activations_15m'),
-        'activations_1h': data.get('activations_1h'),
-        'activations_4h': data.get('activations_4h'),
+        'activations_45m': data.get('activations_45m'),
         'close_prices': data['close_prices'],
         'start_idx': int(data['start_idx']),
+        'lookback_5m': int(data['lookback_5m']),
         'lookback_15m': int(data['lookback_15m']),
-        'lookback_1h': int(data['lookback_1h']),
-        'lookback_4h': int(data['lookback_4h']),
+        'lookback_45m': int(data['lookback_45m']),
     }
 
 
@@ -293,58 +291,47 @@ def main():
     # Load normalized data
     logger.info("Loading normalized data...")
     try:
+        df_5m = pd.read_parquet(config.paths.data_processed / 'features_5m_normalized.parquet')
         df_15m = pd.read_parquet(config.paths.data_processed / 'features_15m_normalized.parquet')
-        df_1h = pd.read_parquet(config.paths.data_processed / 'features_1h_normalized.parquet')
-        df_4h = pd.read_parquet(config.paths.data_processed / 'features_4h_normalized.parquet')
+        df_45m = pd.read_parquet(config.paths.data_processed / 'features_45m_normalized.parquet')
     except FileNotFoundError:
         logger.error("Normalized data not found. Run the pipeline first to generate it.")
         sys.exit(1)
     
-    # Feature columns - MUST match what Analyst was trained with (18 features)
-    # Base 11 features + 3 market sessions + 4 structure breaks = 18
-    feature_cols = [
-        # Base features (11)
-        'returns', 'volatility',
-        'pinbar', 'engulfing', 'doji',
-        'ema_trend', 'ema_crossover',
-        'regime', 'sma_distance',
-        'dist_to_resistance', 'dist_to_support',
-        # Market sessions (3)
-        'session_asian', 'session_london', 'session_ny',
-        # Structure breaks (4)
-        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
-    ]
+    # Feature columns - MUST match what the saved Analyst checkpoint expects.
+    # IMPORTANT: Order matters (must match training-time feature order).
+    from src.live.bridge_constants import MODEL_FEATURE_COLS
+    feature_cols = list(MODEL_FEATURE_COLS)
     
     # Check which features are available and add missing ones
     from src.data.features import add_market_sessions, detect_fractals, detect_structure_breaks
     
     # Add market sessions if missing
-    if 'session_asian' not in df_15m.columns:
+    if 'session_asian' not in df_5m.columns:
         logger.info("Adding market session features...")
+        df_5m = add_market_sessions(df_5m)
         df_15m = add_market_sessions(df_15m)
-        df_1h = add_market_sessions(df_1h)
-        df_4h = add_market_sessions(df_4h)
+        df_45m = add_market_sessions(df_45m)
     
     # Add structure breaks if missing
-    if 'bos_bullish' not in df_15m.columns:
+    if 'bos_bullish' not in df_5m.columns:
         logger.info("Adding structure break features...")
-        df_15m = detect_fractals(df_15m)
-        df_1h = detect_fractals(df_1h)
-        df_4h = detect_fractals(df_4h)
-        df_15m = detect_structure_breaks(df_15m)
-        df_1h = detect_structure_breaks(df_1h)
-        df_4h = detect_structure_breaks(df_4h)
+        for df in [df_5m, df_15m, df_45m]:
+            f_high, f_low = detect_fractals(df)
+            struct_df = detect_structure_breaks(df, f_high, f_low)
+            for col in struct_df.columns:
+                df[col] = struct_df[col]
     
     # Filter to available columns
-    feature_cols = [c for c in feature_cols if c in df_15m.columns]
+    feature_cols = [c for c in feature_cols if c in df_5m.columns]
     logger.info(f"Using {len(feature_cols)} features: {feature_cols}")
     
     # Pre-compute
     output = precompute_analyst_outputs(
         analyst_path=analyst_path,
+        df_5m=df_5m,
         df_15m=df_15m,
-        df_1h=df_1h,
-        df_4h=df_4h,
+        df_45m=df_45m,
         feature_cols=feature_cols,
         device=device,
         batch_size=args.batch_size,

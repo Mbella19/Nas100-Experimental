@@ -205,9 +205,9 @@ class FeatureNormalizer:
 
 
 def normalize_multi_timeframe(
+    df_5m: pd.DataFrame,
     df_15m: pd.DataFrame,
-    df_1h: pd.DataFrame,
-    df_4h: pd.DataFrame,
+    df_45m: pd.DataFrame,
     feature_cols: List[str],
     train_end_idx: Optional[int] = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, FeatureNormalizer]]:
@@ -216,68 +216,68 @@ def normalize_multi_timeframe(
 
     CRITICAL: Each timeframe MUST have its own normalizer because scale-dependent
     features (ATR, volatility, etc.) are naturally larger on higher timeframes:
-    - 15m ATR: ~5 pips
-    - 4H ATR: ~20 pips
+    - 5m ATR: ~3 pips
+    - 45m ATR: ~15 pips
 
-    Using 15m statistics on 4H data would make 4H ATR look like +4.0 Z-score outliers
+    Using 5m statistics on 45m data would make 45m ATR look like +4.0 Z-score outliers
     constantly, confusing the neural network.
 
     Args:
+        df_5m: 5-minute DataFrame (base timeframe)
         df_15m: 15-minute DataFrame
-        df_1h: 1-hour DataFrame
-        df_4h: 4-hour DataFrame
+        df_45m: 45-minute DataFrame
         feature_cols: Columns to normalize
-        train_end_idx: End index of training data for 15m (proportionally adjusted for others)
+        train_end_idx: End index of training data for 5m (proportionally adjusted for others)
 
     Returns:
-        Tuple of (normalized_15m, normalized_1h, normalized_4h, normalizers_dict)
+        Tuple of (normalized_5m, normalized_15m, normalized_45m, normalizers_dict)
     """
     # Determine training portion for each timeframe
     if train_end_idx is None:
-        train_end_idx = int(len(df_15m) * 0.85)
+        train_end_idx = int(len(df_5m) * 0.85)
 
     # Calculate proportional train indices for higher timeframes
-    train_ratio = train_end_idx / len(df_15m)
-    train_end_1h = int(len(df_1h) * train_ratio)
-    train_end_4h = int(len(df_4h) * train_ratio)
+    train_ratio = train_end_idx / len(df_5m)
+    train_end_15m = int(len(df_15m) * train_ratio)
+    train_end_45m = int(len(df_45m) * train_ratio)
 
     logger.info(f"Fitting separate normalizers per timeframe (prevents cross-timeframe scale issues)")
-    logger.info(f"  15m: fit on indices 0-{train_end_idx}")
-    logger.info(f"  1h:  fit on indices 0-{train_end_1h}")
-    logger.info(f"  4h:  fit on indices 0-{train_end_4h}")
+    logger.info(f"  5m:  fit on indices 0-{train_end_idx}")
+    logger.info(f"  15m: fit on indices 0-{train_end_15m}")
+    logger.info(f"  45m: fit on indices 0-{train_end_45m}")
 
     # Create and fit SEPARATE normalizers for each timeframe
+    normalizer_5m = FeatureNormalizer(feature_cols)
     normalizer_15m = FeatureNormalizer(feature_cols)
-    normalizer_1h = FeatureNormalizer(feature_cols)
-    normalizer_4h = FeatureNormalizer(feature_cols)
+    normalizer_45m = FeatureNormalizer(feature_cols)
 
-    normalizer_15m.fit(df_15m.iloc[:train_end_idx])
-    normalizer_1h.fit(df_1h.iloc[:train_end_1h])
-    normalizer_4h.fit(df_4h.iloc[:train_end_4h])
+    normalizer_5m.fit(df_5m.iloc[:train_end_idx])
+    normalizer_15m.fit(df_15m.iloc[:train_end_15m])
+    normalizer_45m.fit(df_45m.iloc[:train_end_45m])
 
     # Log ATR stats to verify proper normalization
     if 'atr' in feature_cols:
         logger.info("ATR statistics by timeframe (verifying proper scaling):")
+        if 'atr' in normalizer_5m.means:
+            logger.info(f"  5m ATR:  mean={normalizer_5m.means['atr']:.6f}, std={normalizer_5m.stds['atr']:.6f}")
         if 'atr' in normalizer_15m.means:
             logger.info(f"  15m ATR: mean={normalizer_15m.means['atr']:.6f}, std={normalizer_15m.stds['atr']:.6f}")
-        if 'atr' in normalizer_1h.means:
-            logger.info(f"  1h ATR:  mean={normalizer_1h.means['atr']:.6f}, std={normalizer_1h.stds['atr']:.6f}")
-        if 'atr' in normalizer_4h.means:
-            logger.info(f"  4h ATR:  mean={normalizer_4h.means['atr']:.6f}, std={normalizer_4h.stds['atr']:.6f}")
+        if 'atr' in normalizer_45m.means:
+            logger.info(f"  45m ATR: mean={normalizer_45m.means['atr']:.6f}, std={normalizer_45m.stds['atr']:.6f}")
 
     # Transform each timeframe with ITS OWN normalizer
+    df_5m_norm = normalizer_5m.transform(df_5m)
     df_15m_norm = normalizer_15m.transform(df_15m)
-    df_1h_norm = normalizer_1h.transform(df_1h)
-    df_4h_norm = normalizer_4h.transform(df_4h)
+    df_45m_norm = normalizer_45m.transform(df_45m)
 
     # Return dict of normalizers for saving
     normalizers = {
+        '5m': normalizer_5m,
         '15m': normalizer_15m,
-        '1h': normalizer_1h,
-        '4h': normalizer_4h
+        '45m': normalizer_45m
     }
 
-    return df_15m_norm, df_1h_norm, df_4h_norm, normalizers
+    return df_5m_norm, df_15m_norm, df_45m_norm, normalizers
 
 
 class RobustNormalizer:

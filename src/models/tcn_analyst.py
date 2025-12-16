@@ -1,430 +1,211 @@
-"""
-TCN (Temporal Convolutional Network) Market Analyst Model.
-
-A simpler, more stable alternative to the Transformer-based Analyst.
-TCNs are better suited for time series classification due to:
-- Built-in temporal causality (dilated convolutions)
-- Stable gradient flow (no attention collapse)
-- Parameter efficient (shared conv kernels)
-- Proven performance on financial time series
-
-This module provides a drop-in replacement for MarketAnalyst with
-the same interface (forward, get_context, get_probabilities, freeze/unfreeze).
-"""
-
 import torch
 import torch.nn as nn
-from torch.nn.utils import weight_norm
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Union, List
 import gc
 
+from .fusion import AttentionFusion, ConcatFusion
 
-class TCNResidualBlock(nn.Module):
+class TCNBlock(nn.Module):
     """
-    Residual block with dilated causal convolutions.
-
-    Architecture per block:
-        Conv1D (dilated) → WeightNorm → GELU → Dropout
-        Conv1D (dilated) → WeightNorm → GELU → Dropout
-        + Residual connection (with 1x1 conv if channels differ)
-
-    Dilated convolutions allow exponentially growing receptive field:
-    - dilation=1: sees 3 timesteps
-    - dilation=2: sees 5 timesteps
-    - dilation=4: sees 9 timesteps
-
-    WeightNorm is used instead of BatchNorm for stability with small batches.
+    Residual TCN Block: Dilated Conv1D -> WeightNorm -> ReLU -> Dropout
     """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        dilation: int = 1,
-        dropout: float = 0.2
-    ):
-        super().__init__()
-
-        # Causal padding: pad only the left side to maintain causality
-        # For kernel_size=3 and dilation=d, we need (k-1)*d padding on left
-        padding = (kernel_size - 1) * dilation
-
-        # First conv layer with weight normalization
-        self.conv1 = weight_norm(nn.Conv1d(
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, padding, dropout=0.2):
+        super(TCNBlock, self).__init__()
+        self.conv1 = nn.utils.weight_norm(nn.Conv1d(
             in_channels, out_channels, kernel_size,
             padding=padding, dilation=dilation
         ))
-        self.chomp1 = padding  # Amount to trim from right side
+        self.chomp1 = nn.Conv1d(out_channels, out_channels, 1) # Dummy chomp implemented via slicing below
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
 
-        # Second conv layer with weight normalization
-        self.conv2 = weight_norm(nn.Conv1d(
+        self.conv2 = nn.utils.weight_norm(nn.Conv1d(
             out_channels, out_channels, kernel_size,
             padding=padding, dilation=dilation
         ))
-        self.chomp2 = padding
+        self.chomp2 = nn.Conv1d(out_channels, out_channels, 1)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
 
-        # Activation and dropout
-        self.activation = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
+        self.net = nn.Sequential(
+            self.conv1, self.relu1, self.dropout1,
+            self.conv2, self.relu2, self.dropout2
+        )
+        
+        self.downsample = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
+        self.relu = nn.ReLU()
+        
+        # Calculate amount to chomp (remove from end)
+        self.padding = padding
 
-        # Residual connection - downsample if channels change
-        if in_channels != out_channels:
-            self.residual = nn.Conv1d(in_channels, out_channels, 1)
-        else:
-            self.residual = nn.Identity()
-
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self):
-        """Xavier initialization for stability."""
-        for module in [self.conv1, self.conv2]:
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch, channels, seq_len]
-        Returns:
-            [batch, channels, seq_len]
-        """
-        # First conv + activation + dropout
+    def forward(self, x):
         out = self.conv1(x)
-        # Chomp: remove the future padding (causal)
-        out = out[:, :, :-self.chomp1] if self.chomp1 > 0 else out
-        out = self.activation(out)
-        out = self.dropout(out)
+        out = out[:, :, :-self.padding] # Chomp
+        out = self.relu1(out)
+        out = self.dropout1(out)
 
-        # Second conv + activation + dropout
         out = self.conv2(out)
-        out = out[:, :, :-self.chomp2] if self.chomp2 > 0 else out
-        out = self.activation(out)
-        out = self.dropout(out)
+        out = out[:, :, :-self.padding] # Chomp
+        out = self.relu2(out)
+        out = self.dropout2(out)
 
-        # Residual connection
-        residual = self.residual(x)
-        return out + residual
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
 
-
-class TCNEncoder(nn.Module):
+class TemporalConvNet(nn.Module):
     """
-    TCN encoder for a single timeframe.
-
-    Architecture:
-        Input projection → Stacked residual blocks with increasing dilation → Global pooling
-
-    The dilation pattern [1, 2, 4, 8, ...] creates exponentially growing receptive field,
-    allowing the model to capture both short-term and long-term patterns efficiently.
+    Stack of TCN Blocks.
     """
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 64,
-        num_blocks: int = 4,  # FIXED: Increased from 3 to 4 for larger receptive field
-        kernel_size: int = 3,
-        dropout: float = 0.2
-    ):
-        """
-        Args:
-            input_dim: Number of input features per timestep
-            hidden_dim: Hidden dimension (output dimension)
-            num_blocks: Number of residual blocks (each doubles dilation)
-                        - 3 blocks: RF = 1 + 2×(k-1)×7 = 29 (insufficient for 48-bar lookback)
-                        - 4 blocks: RF = 1 + 2×(k-1)×15 = 61 (covers full 48-bar lookback)
-            kernel_size: Convolution kernel size
-            dropout: Dropout rate
-        """
-        super().__init__()
-
-        self.hidden_dim = hidden_dim
-
-        # Input projection to hidden dimension
-        self.input_proj = nn.Conv1d(input_dim, hidden_dim, 1)
-
-        # Stack of residual blocks with exponentially increasing dilation
-        self.blocks = nn.ModuleList()
-        for i in range(num_blocks):
-            dilation = 2 ** i  # 1, 2, 4, 8, ...
-            self.blocks.append(TCNResidualBlock(
-                in_channels=hidden_dim,
-                out_channels=hidden_dim,
-                kernel_size=kernel_size,
-                dilation=dilation,
+    def __init__(self, num_inputs, num_channels, kernel_size=2, dropout=0.2):
+        super(TemporalConvNet, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            layers += [TCNBlock(
+                in_channels, out_channels, kernel_size, 
+                dilation=dilation_size,
+                padding=(kernel_size-1) * dilation_size, 
                 dropout=dropout
-            ))
+            )]
 
-        # Layer norm for output stability
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.network = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch, seq_len, input_dim]
-        Returns:
-            [batch, hidden_dim] - single vector summarizing the sequence
-        """
-        # Ensure float32
-        x = x.float()
-
-        # Conv1D expects [batch, channels, seq_len]
-        x = x.transpose(1, 2)
-
-        # Project to hidden dimension
-        x = self.input_proj(x)
-
-        # Apply residual blocks
-        for block in self.blocks:
-            x = block(x)
-
-        # Back to [batch, seq_len, hidden_dim]
-        x = x.transpose(1, 2)
-
-        # Global average pooling: aggregate sequence to single vector
-        # This is more stable than using last token (less sensitive to sequence length)
-        x = x.mean(dim=1)  # [batch, hidden_dim]
-
-        # Layer norm for stability
-        x = self.layer_norm(x)
-
-        return x
-
+    def forward(self, x):
+        return self.network(x)
 
 class TCNAnalyst(nn.Module):
     """
-    Multi-timeframe TCN Market Analyst.
-
-    Drop-in replacement for MarketAnalyst (Transformer-based) with the same interface.
-
-    Architecture:
-        - 3 TCN encoders (15m, 1H, 4H)
-        - Simple concatenation fusion (no attention)
-        - Direction prediction head
-
-    Why TCN over Transformer:
-        - No attention collapse (the persistent issue in v10-v12)
-        - Stable gradient flow through convolutions
-        - 4x fewer parameters (93K vs 370K)
-        - Faster training
+    Market Analyst using Temporal Convolutional Networks (TCN).
+    Processing independent timeframes and fusing them.
     """
-
     def __init__(
         self,
         feature_dims: Dict[str, int],
         d_model: int = 64,
-        nhead: int = 4,  # Not used, kept for interface compatibility
-        num_layers: int = 2,  # Not used, kept for interface compatibility
-        dim_feedforward: int = 128,  # Not used
         context_dim: int = 64,
         dropout: float = 0.3,
-        use_lightweight: bool = False,  # Not used
         num_classes: int = 2,
-        num_blocks: int = 3,
-        kernel_size: int = 3
+        num_blocks: int = 3,  # Depth of TCN
+        kernel_size: int = 3,
+        tcn_num_channels: Optional[List[int]] = None
     ):
-        """
-        Args:
-            feature_dims: Dict mapping timeframe to input feature dimension
-                         e.g., {'15m': 12, '1h': 12, '4h': 12}
-            d_model: Hidden dimension for TCN encoders
-            context_dim: Output context vector dimension
-            dropout: Dropout rate
-            num_classes: 2 for binary classification
-            num_blocks: Number of TCN residual blocks per encoder
-            kernel_size: Convolution kernel size
-        """
         super().__init__()
-
+        self.architecture = "tcn"
+        self.feature_dims = feature_dims
         self.d_model = d_model
         self.context_dim = context_dim
         self.num_classes = num_classes
-        self.dropout = dropout
+        # Store TCN hyperparams for checkpointing/loading
         self.tcn_num_blocks = num_blocks
         self.tcn_kernel_size = kernel_size
 
-        # TCN encoder for each timeframe
-        self.encoder_15m = TCNEncoder(
-            input_dim=feature_dims.get('15m', 12),
-            hidden_dim=d_model,
-            num_blocks=num_blocks,
-            kernel_size=kernel_size,
-            dropout=dropout
-        )
-        self.encoder_1h = TCNEncoder(
-            input_dim=feature_dims.get('1h', 12),
-            hidden_dim=d_model,
-            num_blocks=num_blocks,
-            kernel_size=kernel_size,
-            dropout=dropout
-        )
-        self.encoder_4h = TCNEncoder(
-            input_dim=feature_dims.get('4h', 12),
-            hidden_dim=d_model,
-            num_blocks=num_blocks,
-            kernel_size=kernel_size,
-            dropout=dropout
-        )
+        # Feature Projections (Input -> d_model)
+        self.projections = nn.ModuleDict({
+            tf: nn.Linear(dim, d_model) 
+            for tf, dim in feature_dims.items()
+        })
 
-        # Simple concatenation fusion (no attention = no collapse)
-        # 3 timeframes * d_model features = 3*d_model input
-        self.fusion = nn.Sequential(
-            nn.Linear(3 * d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.LayerNorm(d_model)
-        )
-
-        # Context projection (if d_model != context_dim)
-        if d_model != context_dim:
-            self.context_proj = nn.Sequential(
-                nn.Linear(d_model, context_dim),
-                nn.LayerNorm(context_dim)
-            )
+        # TCN Encoders for each timeframe
+        # Default: increasing channel depth per block for higher capacity.
+        if tcn_num_channels is not None and len(tcn_num_channels) > 0:
+            num_channels = list(tcn_num_channels)
+            if len(num_channels) != num_blocks:
+                # Backwards/defensive: if list length doesn't match, fall back to constant
+                num_channels = [d_model] * num_blocks
         else:
-            self.context_proj = nn.Identity()
+            # Increasing channel depth: [d_model, d_model*2, d_model*4, ...]
+            num_channels = [d_model * (2 ** i) for i in range(num_blocks)]
+            # Ensure convergence back to d_model for fusion
+            num_channels[-1] = d_model
 
-        # Direction prediction head (binary: single logit)
-        if num_classes == 2:
-            self.direction_head = nn.Sequential(
-                nn.Linear(context_dim, context_dim // 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(context_dim // 2, 1)
+        # Store for checkpointing / loading
+        self.tcn_num_channels = num_channels
+        
+        self.tcns = nn.ModuleDict({
+            tf: TemporalConvNet(
+                num_inputs=d_model,
+                num_channels=num_channels,
+                kernel_size=kernel_size,
+                dropout=dropout
             )
-        else:
-            self.direction_head = nn.Sequential(
-                nn.Linear(context_dim, context_dim // 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(context_dim // 2, num_classes)
-            )
+            for tf in feature_dims.keys()
+        })
 
-        # Auxiliary heads (kept for interface compatibility, can be disabled)
-        self.volatility_head = nn.Sequential(
-            nn.Linear(context_dim, context_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(context_dim // 2, 1)
+        # Fusion Mechanism
+        self.fusion = AttentionFusion(d_model=d_model, nhead=4)
+
+        combined_dim = d_model
+
+        # Final Context Projection
+        self.context_proj = nn.Sequential(
+            nn.Linear(combined_dim, context_dim),
+            nn.ReLU(),
+            nn.LayerNorm(context_dim)
         )
 
-        self.regime_head = nn.Sequential(
-            nn.Linear(context_dim, context_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(context_dim // 2, 1)
-        )
+        # Prediction Heads
+        self.direction_head = nn.Linear(context_dim, num_classes if num_classes > 2 else 1)
+        self.volatility_head = nn.Linear(context_dim, 1)
+        self.regime_head = nn.Linear(context_dim, 3) # Bull/Bear/Range
+        
+        # Multi-horizon heads (optional)
+        self.horizon_1h_head = nn.Linear(context_dim, 1)
+        self.horizon_2h_head = nn.Linear(context_dim, 1)
 
-        # Multi-horizon heads (binary mode only)
-        if num_classes == 2:
-            self.horizon_1h_head = nn.Sequential(
-                nn.Linear(context_dim, context_dim // 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(context_dim // 2, 1)
-            )
-            self.horizon_2h_head = nn.Sequential(
-                nn.Linear(context_dim, context_dim // 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(context_dim // 2, 1)
-            )
-        else:
-            self.horizon_1h_head = None
-            self.horizon_2h_head = None
-
-        # Legacy alias
-        self.trend_head = self.direction_head
-
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self):
-        """Initialize linear layers with Xavier uniform."""
-        for module in [self.fusion, self.context_proj, self.direction_head,
-                       self.volatility_head, self.regime_head]:
-            if isinstance(module, nn.Sequential):
-                for layer in module:
-                    if isinstance(layer, nn.Linear):
-                        nn.init.xavier_uniform_(layer.weight)
-                        if layer.bias is not None:
-                            # Small positive bias to break symmetry
-                            nn.init.constant_(layer.bias, 0.1)
-
-        # Multi-horizon heads
-        for head in [self.horizon_1h_head, self.horizon_2h_head]:
-            if head is not None:
-                for layer in head:
-                    if isinstance(layer, nn.Linear):
-                        nn.init.xavier_uniform_(layer.weight)
-                        if layer.bias is not None:
-                            nn.init.constant_(layer.bias, 0.1)
+    def _process_timeframe(self, x: torch.Tensor, tf: str) -> torch.Tensor:
+        """
+        Process a single timeframe through Projection -> TCN -> Pooling.
+        """
+        if x.dim() == 2:
+             x = x.unsqueeze(1)
+        
+        x_proj = self.projections[tf](x)
+        x_tcn_in = x_proj.transpose(1, 2)
+        x_tcn_out = self.tcns[tf](x_tcn_in)
+        return x_tcn_out[:, :, -1]
 
     def _encode_and_fuse(
-        self,
-        x_15m: torch.Tensor,
-        x_1h: torch.Tensor,
-        x_4h: torch.Tensor
+        self, 
+        x_5m: torch.Tensor, 
+        x_15m: torch.Tensor, 
+        x_45m: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Encode all timeframes and fuse to context vector.
-
-        Returns:
-            context: [batch, context_dim]
-            activations: Dict of encoder outputs [batch, d_model]
+        Encodes timeframes and fuses them into a context vector.
         """
-        # Encode each timeframe
-        enc_15m = self.encoder_15m(x_15m)  # [batch, d_model]
-        enc_1h = self.encoder_1h(x_1h)
-        enc_4h = self.encoder_4h(x_4h)
+        encodings = {}
+        
+        enc_5m = self._process_timeframe(x_5m, '5m')
+        enc_15m = self._process_timeframe(x_15m, '15m')
+        enc_45m = self._process_timeframe(x_45m, '45m')
 
-        # Concatenate and fuse (simple, no attention collapse possible)
-        combined = torch.cat([enc_15m, enc_1h, enc_4h], dim=-1)  # [batch, 3*d_model]
-        fused = self.fusion(combined)  # [batch, d_model]
+        encodings['5m'] = enc_5m
+        encodings['15m'] = enc_15m
+        encodings['45m'] = enc_45m
 
-        # Project to context dimension
+        # Fuse multi-timeframe NAS100 context
+        fused = self.fusion(enc_5m, enc_15m, enc_45m)  # [batch, d_model]
+
         context = self.context_proj(fused)  # [batch, context_dim]
 
-        activations = {
-            '15m': enc_15m,
-            '1h': enc_1h,
-            '4h': enc_4h
-        }
-
-        return context, activations
+        return context, encodings
 
     def forward(
         self,
+        x_5m: torch.Tensor,
         x_15m: torch.Tensor,
-        x_1h: torch.Tensor,
-        x_4h: torch.Tensor,
+        x_45m: torch.Tensor,
         return_aux: bool = False,
         return_multi_horizon: bool = False
-    ) -> Tuple[torch.Tensor, ...]:
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, ...]]:
         """
-        Full forward pass for training.
-
-        Same interface as MarketAnalyst.forward().
-
-        Args:
-            x_15m: 15-minute features [batch, seq_len, features]
-            x_1h: 1-hour features [batch, seq_len, features]
-            x_4h: 4-hour features [batch, seq_len, features]
-            return_aux: If True, return auxiliary predictions
-            return_multi_horizon: If True, return multi-horizon predictions
-
-        Returns:
-            Default: (context, direction_logits)
-            With return_aux: (context, direction, volatility, regime)
-            With return_multi_horizon: (context, direction, horizon_1h, horizon_2h)
-            With both: (context, direction, volatility, regime, horizon_1h, horizon_2h)
+        Forward pass.
         """
-        # Encode and fuse
-        context, activations = self._encode_and_fuse(x_15m, x_1h, x_4h)
+        context, activations = self._encode_and_fuse(x_5m, x_15m, x_45m)
 
-        # Direction prediction
         direction = self.direction_head(context)
 
         if not return_aux and not return_multi_horizon:
@@ -447,91 +228,69 @@ class TCNAnalyst(nn.Module):
     @torch.no_grad()
     def get_context(
         self,
+        x_5m: torch.Tensor,
         x_15m: torch.Tensor,
-        x_1h: torch.Tensor,
-        x_4h: torch.Tensor
+        x_45m: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Get context vector only (for RL agent inference).
-
-        Args:
-            x_15m, x_1h, x_4h: Timeframe features
-
-        Returns:
-            Context vector [batch, context_dim]
-        """
-        context, _ = self.forward(x_15m, x_1h, x_4h)
+        """Get context vector only."""
+        context, _ = self.forward(x_5m, x_15m, x_45m)
         return context
 
     @torch.no_grad()
     def get_probabilities(
         self,
+        x_5m: torch.Tensor,
         x_15m: torch.Tensor,
-        x_1h: torch.Tensor,
-        x_4h: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_45m: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
-        Get context vector AND probabilities (for RL agent).
-
+        Get context vector AND probabilities.
         Returns:
-            (context, probs) where probs is [batch, 2] as [p_down, p_up]
+            context: [batch, context_dim]
+            probs: [batch, num_classes]
+            attn_weights: Always None (legacy slot)
         """
-        context, logits = self.forward(x_15m, x_1h, x_4h)
+        context, activations = self._encode_and_fuse(x_5m, x_15m, x_45m)
+        logits = self.direction_head(context)
 
         if self.num_classes == 2:
-            p_up = torch.sigmoid(logits)  # [batch, 1]
+            p_up = torch.sigmoid(logits)
             p_down = 1 - p_up
-            probs = torch.cat([p_down, p_up], dim=-1)  # [batch, 2]
+            probs = torch.cat([p_down, p_up], dim=-1)
         else:
             probs = torch.softmax(logits, dim=-1)
 
-        return context, probs
+        return context, probs, None
 
     @torch.no_grad()
     def get_activations(
         self,
+        x_5m: torch.Tensor,
         x_15m: torch.Tensor,
-        x_1h: torch.Tensor,
-        x_4h: torch.Tensor
+        x_45m: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Get context vector AND internal activations (for visualization).
-
-        Returns:
-            (context, activations_dict)
-        """
-        context, activations = self._encode_and_fuse(x_15m, x_1h, x_4h)
+        """Get context vector AND internal activations."""
+        context, activations = self._encode_and_fuse(x_5m, x_15m, x_45m)
         return context, activations
 
     def freeze(self):
-        """Freeze all parameters for use with RL agent."""
+        """Freeze all parameters."""
         self.eval()
         for param in self.parameters():
             param.requires_grad = False
 
     def unfreeze(self):
-        """Unfreeze parameters for fine-tuning."""
+        """Unfreeze parameters."""
         self.train()
         for param in self.parameters():
             param.requires_grad = True
-
 
 def create_tcn_analyst(
     feature_dims: Dict[str, int],
     config: Optional[object] = None,
     device: Optional[torch.device] = None
 ) -> TCNAnalyst:
-    """
-    Factory function to create a TCN Analyst with config.
-
-    Args:
-        feature_dims: Feature dimensions per timeframe
-        config: AnalystConfig object (optional)
-        device: Target device
-
-    Returns:
-        TCNAnalyst model
-    """
+    """Factory function."""
     if config is None:
         model = TCNAnalyst(
             feature_dims=feature_dims,
@@ -545,12 +304,13 @@ def create_tcn_analyst(
     else:
         model = TCNAnalyst(
             feature_dims=feature_dims,
-            d_model=config.d_model,
-            context_dim=config.context_dim,
-            dropout=config.dropout,
+            d_model=getattr(config, 'd_model', 64),
+            context_dim=getattr(config, 'context_dim', 64),
+            dropout=getattr(config, 'dropout', 0.3),
             num_classes=getattr(config, 'num_classes', 2),
             num_blocks=getattr(config, 'tcn_num_blocks', 3),
-            kernel_size=getattr(config, 'tcn_kernel_size', 3)
+            kernel_size=getattr(config, 'tcn_kernel_size', 3),
+            tcn_num_channels=getattr(config, 'tcn_num_channels', None),
         )
 
     if device is not None:
@@ -558,44 +318,81 @@ def create_tcn_analyst(
 
     return model
 
-
 def load_tcn_analyst(
     path: str,
     feature_dims: Dict[str, int],
     device: Optional[torch.device] = None,
     freeze: bool = True
 ) -> TCNAnalyst:
-    """
-    Load a trained TCN Analyst from checkpoint.
-
-    Args:
-        path: Path to checkpoint file
-        feature_dims: Feature dimensions (must match training)
-        device: Target device
-        freeze: Whether to freeze the model
-
-    Returns:
-        Loaded TCNAnalyst
-    """
+    """Load TCN Analyst from checkpoint."""
     checkpoint = torch.load(path, map_location=device or 'cpu')
 
-    # Create model from saved config
     if 'config' in checkpoint:
         saved_config = checkpoint['config']
+
+        d_model = saved_config.get('d_model', 64)
+        num_blocks = saved_config.get('tcn_num_blocks', 3)
+
+        # Legacy support: allow checkpoint to specify exact channel schedule.
+        # If missing, infer from state_dict or fall back to constant channels.
+        tcn_num_channels = saved_config.get('tcn_num_channels')
+        if tcn_num_channels is None:
+            inferred: List[int] = []
+            state_dict = checkpoint.get('model_state_dict', {})
+            # Try to find a timeframe key present in the checkpoint
+            tf_key = None
+            for k in state_dict.keys():
+                if k.startswith("tcns.") and ".network.0.conv1.bias" in k:
+                    parts = k.split(".")
+                    if len(parts) > 1:
+                        tf_key = parts[1]
+                        break
+            if tf_key is not None:
+                for i in range(num_blocks):
+                    key = f"tcns.{tf_key}.network.{i}.conv1.bias"
+                    if key in state_dict:
+                        inferred.append(int(state_dict[key].shape[0]))
+            if len(inferred) == num_blocks:
+                tcn_num_channels = inferred
+            else:
+                tcn_num_channels = [d_model] * num_blocks
+
         model = TCNAnalyst(
             feature_dims=feature_dims,
-            d_model=saved_config.get('d_model', 64),
+            d_model=d_model,
             context_dim=saved_config.get('context_dim', 64),
             dropout=saved_config.get('dropout', 0.3),
             num_classes=saved_config.get('num_classes', 2),
-            num_blocks=saved_config.get('tcn_num_blocks', 3),
-            kernel_size=saved_config.get('tcn_kernel_size', 3)
+            num_blocks=num_blocks,
+            kernel_size=saved_config.get('tcn_kernel_size', 3),
+            tcn_num_channels=tcn_num_channels,
         )
     else:
-        model = create_tcn_analyst(feature_dims)
+        model = TCNAnalyst(
+            feature_dims=feature_dims,
+            d_model=64,
+            context_dim=64,
+            dropout=0.3,
+            num_classes=2,
+            num_blocks=3,
+            kernel_size=3
+        )
 
-    # Load state dict
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load state dict with shape-mismatch tolerance
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    try:
+        model.load_state_dict(state_dict, strict=False)
+    except RuntimeError as e:
+        # Filter out incompatible shapes (e.g., architecture change) and retry.
+        model_state = model.state_dict()
+        compatible = {
+            k: v for k, v in state_dict.items()
+            if k in model_state and model_state[k].shape == v.shape
+        }
+        skipped = len(state_dict) - len(compatible)
+        if skipped > 0:
+            print(f"⚠️ load_tcn_analyst: skipped {skipped} mismatched keys. Retraining recommended.")
+        model.load_state_dict(compatible, strict=False)
 
     if device is not None:
         model = model.to(device)
@@ -603,10 +400,11 @@ def load_tcn_analyst(
     if freeze:
         model.freeze()
 
-    # Clear memory
     del checkpoint
     gc.collect()
-    if torch.backends.mps.is_available():
+    try:
         torch.mps.empty_cache()
+    except:
+        pass
 
     return model

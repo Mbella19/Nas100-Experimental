@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 def detect_pinbar(
     df: pd.DataFrame,
     wick_ratio: float = 2.0,
-    min_body_pips: float = 0.0002,
-    min_range_pips: float = 0.0005
+    min_body_pips: float = 2.0,    # NAS100: 2 points (was 0.0002 for EURUSD)
+    min_range_pips: float = 5.0   # NAS100: 5 points (was 0.0005 for EURUSD)
 ) -> pd.Series:
     """
     Detect pinbar candles (rejection candles with long wicks).
@@ -35,8 +35,8 @@ def detect_pinbar(
     Args:
         df: OHLCV DataFrame
         wick_ratio: Minimum wick-to-body ratio
-        min_body_pips: Minimum body size in price units (0.0002 = 2 pips for EURUSD)
-        min_range_pips: Minimum candle range in price units (0.0005 = 5 pips for EURUSD)
+        min_body_pips: Minimum body size in price units (2.0 = 2 points for NAS100)
+        min_range_pips: Minimum candle range in price units (5.0 = 5 points for NAS100)
 
     Returns:
         Series with values: 1 (bullish), -1 (bearish), 0 (none)
@@ -513,8 +513,8 @@ def market_regime(
 
     result = pd.Series(0, index=df.index, dtype=np.float32)
 
-    # Trending: low chop + high ADX
-    trending = (chop < 38.2) | (adx_val > 25)
+    # Trending: low chop + high ADX (both conditions)
+    trending = (chop < 38.2) & (adx_val > 25)
     # Ranging: high chop + low ADX
     ranging = (chop > 61.8) & (adx_val < 20)
 
@@ -750,7 +750,8 @@ def create_smoothed_target(
 
 def create_return_classes(
     target: pd.Series,
-    class_std_thresholds: Tuple = (-0.5, 0.5)
+    class_std_thresholds: Tuple = (-0.5, 0.5),
+    train_end_idx: Optional[int] = None
 ) -> Tuple[pd.Series, Dict[str, float]]:
     """
     Convert a continuous smoothed-return target into discrete classes.
@@ -777,7 +778,13 @@ def create_return_classes(
     Returns:
         Tuple of (class labels Series with NaNs preserved, metadata dict)
     """
-    target_std = float(target.dropna().std())
+    # IMPORTANT: To prevent look-ahead bias, compute std on TRAINING portion only
+    if train_end_idx is not None:
+        std_source = target.iloc[:train_end_idx].dropna()
+    else:
+        std_source = target.dropna()
+
+    target_std = float(std_source.std())
     num_thresholds = len(class_std_thresholds)
 
     if num_thresholds == 2:
@@ -1230,5 +1237,5 @@ def get_feature_columns(include_ohlcv: bool = False) -> List[str]:
         'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
     ]
     if include_ohlcv:
-        features = ['open', 'high', 'low', 'close', 'volume'] + features
+        features = ['open', 'high', 'low', 'close'] + features
     return features

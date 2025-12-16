@@ -13,10 +13,17 @@ Features:
 - Episode-level tracking and analysis
 """
 
+import os
+from pathlib import Path
+
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    str(Path(__file__).resolve().parents[2] / ".mplconfig"),
+)
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
 from typing import Optional, Dict, Tuple, List
 from datetime import datetime
 import gc
@@ -38,14 +45,6 @@ from ..data.features import (
     detect_structure_breaks
 )
 
-# Visualization imports (optional, non-blocking)
-try:
-    from visualization import get_emitter
-    VISUALIZATION_AVAILABLE = True
-except ImportError:
-    VISUALIZATION_AVAILABLE = False
-    get_emitter = None
-
 logger = get_logger(__name__)
 
 
@@ -64,12 +63,15 @@ class AgentTrainingLogger(BaseCallback):
         self,
         log_dir: Optional[str] = None,
         log_freq: int = 1000,
-        verbose: int = 1,
-        enable_visualization: bool = False
+        checkpoint_plot_freq: int = 100_000,
+        reward_plot_downsample: int = 1_000,
+        verbose: int = 1
     ):
         super().__init__(verbose)
         self.log_dir = Path(log_dir) if log_dir else None
         self.log_freq = log_freq
+        self.checkpoint_plot_freq = checkpoint_plot_freq
+        self.reward_plot_downsample = max(1, int(reward_plot_downsample))
 
         # Tracking variables
         self.episode_rewards: List[float] = []
@@ -79,7 +81,11 @@ class AgentTrainingLogger(BaseCallback):
         self.episode_win_rates: List[float] = []
         self.action_counts = {0: 0, 1: 0, 2: 0}  # Flat, Long, Short
         self.size_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # Position sizes: 0.25, 0.5, 0.75, 1.0
-        self.timestep_rewards: List[float] = []
+        # Cumulative reward tracking (downsampled for long runs).
+        self._cumulative_reward: float = 0.0
+        self._cumulative_reward_timesteps: List[int] = []
+        self._cumulative_reward_values: List[float] = []
+        self._last_reward_record_timestep: int = 0
 
         # Current episode tracking
         self.current_ep_reward = 0
@@ -89,18 +95,19 @@ class AgentTrainingLogger(BaseCallback):
         # Training start time
         self.start_time = None
 
-        # Visualization emitter (non-blocking)
-        self.enable_visualization = enable_visualization and VISUALIZATION_AVAILABLE
-        self.emitter = get_emitter() if self.enable_visualization else None
-        self.bar_counter = 0  # Incrementing counter for continuous chart timestamps
-        self.last_price_emitted = 0.0  # Track last price to avoid duplicate bars
-        self._prev_price = 0.0  # Previous price for OHLC generation
-
         if self.log_dir:
             self.log_dir.mkdir(parents=True, exist_ok=True)
 
     def _on_training_start(self):
         self.start_time = datetime.now()
+        self._maybe_load_cumulative_reward_history()
+
+        if not self._cumulative_reward_timesteps:
+            start_t = int(getattr(self, "num_timesteps", 0))
+            self._cumulative_reward_timesteps.append(start_t)
+            self._cumulative_reward_values.append(float(self._cumulative_reward))
+            self._last_reward_record_timestep = start_t
+
         logger.info("=" * 70)
         logger.info("PPO AGENT TRAINING STARTED")
         logger.info("=" * 70)
@@ -111,10 +118,26 @@ class AgentTrainingLogger(BaseCallback):
     def _on_step(self) -> bool:
         # Track rewards
         if len(self.locals.get('rewards', [])) > 0:
-            reward = self.locals['rewards'][0]
-            self.timestep_rewards.append(reward)
+            reward = float(np.asarray(self.locals['rewards'])[0])
             self.current_ep_reward += reward
             self.current_ep_length += 1
+            self._cumulative_reward += reward
+
+            timestep = int(getattr(self, "num_timesteps", self.n_calls))
+            if (timestep - self._last_reward_record_timestep) >= self.reward_plot_downsample:
+                self._cumulative_reward_timesteps.append(timestep)
+                self._cumulative_reward_values.append(float(self._cumulative_reward))
+                self._last_reward_record_timestep = timestep
+
+        # Plot cumulative reward after each checkpoint save.
+        if (
+            self.log_dir
+            and self.checkpoint_plot_freq > 0
+            and (self.n_calls % self.checkpoint_plot_freq == 0)
+        ):
+            timestep = int(getattr(self, "num_timesteps", self.n_calls))
+            self._save_cumulative_reward_plot(timestep)
+            self._save_cumulative_reward_history()
 
         # Track actions (direction and size for MultiDiscrete)
         if len(self.locals.get('actions', [])) > 0:
@@ -162,199 +185,14 @@ class AgentTrainingLogger(BaseCallback):
             if n_episodes % 10 == 0:
                 self._log_episode_summary(n_episodes)
 
-            # Emit episode end to visualization
-            if self.emitter is not None:
-                try:
-                    self.emitter.push_episode_end(
-                        episode=n_episodes,
-                        episode_reward=self.current_ep_reward,
-                        episode_pnl=self.episode_pnls[-1] if self.episode_pnls else 0.0,
-                        episode_trades=self.episode_trades[-1] if self.episode_trades else 0,
-                        win_rate=win_rate,
-                        episode_length=self.current_ep_length,
-                    )
-                except Exception:
-                    pass
-
             # Reset current episode tracking
             self.current_ep_reward = 0
             self.current_ep_length = 0
             self.current_ep_actions = []
-            self.last_price_emitted = 0.0  # Reset price tracker for new episode
-            # NOTE: bar_counter NOT reset - keep timestamps continuous for proper chart display
-            self._prev_price = 0.0  # Reset previous price for OHLC
 
         # Periodic detailed logging
         if self.n_calls % self.log_freq == 0:
             self._log_training_progress()
-
-        # Emit to visualization dashboard (non-blocking)
-        if self.emitter is not None:
-            try:
-                infos = self.locals.get('infos', [{}])
-                info = infos[0] if infos else {}
-
-                # Get action details
-                action = self.locals.get('actions', [[0, 0]])[0]
-                action_direction = int(action[0]) if isinstance(action, np.ndarray) and len(action) >= 1 else 0
-                action_size = int(action[1]) if isinstance(action, np.ndarray) and len(action) >= 2 else 0
-
-                # Get reward
-                reward = self.locals.get('rewards', [0])[0] if len(self.locals.get('rewards', [])) > 0 else 0
-
-                # Emit step data
-                # Emit step data
-                
-                # --- NEW METRICS EXTRACTION ---
-                action_probs = None
-                size_probs = None
-                value_estimate = 0.0
-                entropy = 0.0
-                
-                try:
-                    if 'new_obs' in self.locals:
-                        obs = self.locals['new_obs']
-                        # Ensure obs is correct shape/type for policy
-                        obs_tensor = torch.as_tensor(obs).to(self.model.device)
-                        
-                        with torch.no_grad():
-                            # Value estimate
-                            values = self.model.policy.predict_values(obs_tensor)
-                            value_estimate = values[0].item()
-                            
-                            # Action probabilities
-                            # For MlpPolicy with MultiDiscrete, we need to extract features then logits
-                            features = self.model.policy.extract_features(obs_tensor)
-                            latent_pi = self.model.policy.mlp_extractor.forward_actor(features)
-                            logits = self.model.policy.action_net(latent_pi)
-                            
-                            # Split logits: [3, 4] -> first 3 for direction, next 4 for size
-                            action_logits = logits[:, :3]
-                            size_logits = logits[:, 3:]
-                            
-                            # Softmax
-                            action_probs_t = torch.softmax(action_logits, dim=1)
-                            size_probs_t = torch.softmax(size_logits, dim=1)
-                            
-                            action_probs = action_probs_t[0].cpu().numpy().tolist()
-                            size_probs = size_probs_t[0].cpu().numpy().tolist()
-                            
-                            # Approximate entropy
-                            dist = self.model.policy.get_distribution(obs_tensor)
-                            entropy = dist.entropy().mean().item()
-                            
-                except Exception:
-                    pass
-                
-                # Construct reward components
-                reward_components = {
-                    'pnl_delta': info.get('pnl_delta', 0.0),
-                    'direction_bonus': 0.0,  # REMOVED: Was causing reward-PnL divergence
-                    'confidence_bonus': info.get('confidence_bonus', 0.0),
-                    'fomo_penalty': -0.05 if info.get('fomo_triggered') else 0.0,
-                    'chop_penalty': -0.01 if info.get('chop_triggered') else 0.0,
-                    'transaction_cost': 0.0, # Hard to track exact cost here without env access
-                    'total': float(reward)
-                }
-                # ------------------------------
-
-                # Get timestamp for trade markers (use real timestamp if available)
-                if 'ohlc' in info and 'timestamp' in info['ohlc']:
-                    current_bar_timestamp = info['ohlc']['timestamp']
-                else:
-                    # Fallback to synthetic timestamp
-                    base_timestamp = 1700000000
-                    current_bar_timestamp = base_timestamp + (self.bar_counter * 900)
-
-                # Emit trade events with proper timestamp
-                if info.get('trade_opened'):
-                    self.emitter.push_trade(
-                        price=info.get('entry_price', 0.0),
-                        direction=info.get('position', 0),
-                        size=info.get('position_size', 0.0),
-                        is_entry=True,
-                        timestamp=current_bar_timestamp,
-                    )
-                if info.get('trade_closed'):
-                    self.emitter.push_trade(
-                        price=info.get('current_price', 0.0),
-                        direction=info.get('close_direction', 0),
-                        size=info.get('close_size', 0.0),
-                        is_entry=False,
-                        pnl=info.get('pnl', 0.0),
-                        close_reason=info.get('close_reason', 'exit'),
-                        timestamp=current_bar_timestamp,
-                    )
-                    
-                # Extract OHLC from the environment for visualization
-                # Use REAL OHLC data from environment if available
-                ohlc_data = None
-                try:
-                    # Check if environment provides real OHLC data
-                    if 'ohlc' in info:
-                        # Use real OHLC from the trading data
-                        real_ohlc = info['ohlc']
-                        ohlc_data = {
-                            'timestamp': real_ohlc.get('timestamp', 1700000000 + (self.bar_counter * 900)),
-                            'open': real_ohlc['open'],
-                            'high': real_ohlc['high'],
-                            'low': real_ohlc['low'],
-                            'close': real_ohlc['close'],
-                        }
-                        self.bar_counter += 1
-                    else:
-                        # Fallback: Create synthetic OHLC from current_price
-                        current_price = info.get('current_price', 0.0)
-                        if current_price > 0:
-                            prev_price = self._prev_price if self._prev_price > 0 else current_price
-                            base_timestamp = 1700000000  # Nov 2023
-                            bar_timestamp = base_timestamp + (self.bar_counter * 900)
-                            ohlc_data = {
-                                'timestamp': bar_timestamp,
-                                'open': prev_price,
-                                'high': max(prev_price, current_price),
-                                'low': min(prev_price, current_price),
-                                'close': current_price,
-                            }
-                            self.bar_counter += 1
-                            self._prev_price = current_price
-                             
-                except Exception:
-                    pass
-                
-                self.emitter.push_agent_step(
-                    timestep=self.n_calls,
-                    episode=len(self.episode_rewards),
-                    reward=float(reward),
-                    action_direction=action_direction,
-                    action_size=action_size,
-                    position=info.get('position', 0),
-                    position_size=info.get('position_size', 0.0),
-                    entry_price=info.get('entry_price'),
-                    current_price=info.get('current_price', 0.0),
-                    unrealized_pnl=info.get('unrealized_pnl', 0.0),
-                    total_pnl=info.get('total_pnl', 0.0),
-                    n_trades=info.get('n_trades', 0),
-                    atr=info.get('atr', 0.0),
-                    chop=info.get('chop', 50.0),
-                    adx=info.get('adx', 25.0),
-                    regime=info.get('regime', 1),
-                    sma_distance=info.get('sma_distance', 0.0),
-                    p_down=info.get('p_down', 0.5),
-                    p_up=info.get('p_up', 0.5),
-                    attention_weights=info.get('attention_weights'),
-                    sl_level=info.get('sl_level'),
-                    tp_level=info.get('tp_level'),
-                    # New metrics
-                    value_estimate=value_estimate,
-                    action_probs=action_probs,
-                    size_probs=size_probs,
-                    reward_components=reward_components,
-                    ohlc=ohlc_data,  # Add OHLC data
-                    activations=info.get('analyst_activations'), # Add activations
-                )
-            except Exception:
-                pass  # Never block training
 
         return True
 
@@ -395,13 +233,21 @@ class AgentTrainingLogger(BaseCallback):
             logger.info(f"  Avg PnL: {np.mean(self.episode_pnls):.2f} pips")
 
         # Memory info
-        if torch.backends.mps.is_available():
+        device_type = getattr(getattr(self.model, 'device', None), 'type', None)
+        if device_type == "mps" and torch.backends.mps.is_available():
             torch.mps.empty_cache()
+        elif device_type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
 
     def _on_training_end(self):
         """Log final training summary and create visualizations."""
         total_time = (datetime.now() - self.start_time).total_seconds()
+
+        if self.log_dir:
+            timestep = int(getattr(self, "num_timesteps", self.n_calls))
+            self._save_cumulative_reward_plot(timestep, is_final=True)
+            self._save_cumulative_reward_history()
 
         logger.info("=" * 70)
         logger.info("PPO AGENT TRAINING COMPLETED")
@@ -421,7 +267,73 @@ class AgentTrainingLogger(BaseCallback):
         # Save metrics
         if self.log_dir:
             self._save_metrics()
-            self._create_visualizations()
+        self._create_visualizations()
+
+    def _cumulative_reward_history_path(self) -> Optional[Path]:
+        if not self.log_dir:
+            return None
+        return self.log_dir / "cumulative_reward_history.npz"
+
+    def _maybe_load_cumulative_reward_history(self) -> None:
+        """Load cumulative reward history if present (useful when resuming training)."""
+        path = self._cumulative_reward_history_path()
+        if path is None or not path.is_file():
+            return
+        try:
+            with np.load(path) as data:
+                if "timesteps" not in data or "cumulative_reward" not in data:
+                    return
+                timesteps = data["timesteps"]
+                values = data["cumulative_reward"]
+
+            self._cumulative_reward_timesteps = [int(t) for t in np.asarray(timesteps).tolist()]
+            self._cumulative_reward_values = [float(v) for v in np.asarray(values).tolist()]
+            if self._cumulative_reward_values and self._cumulative_reward_timesteps:
+                self._cumulative_reward = float(self._cumulative_reward_values[-1])
+                self._last_reward_record_timestep = int(self._cumulative_reward_timesteps[-1])
+        except Exception as exc:
+            logger.warning(f"Failed to load cumulative reward history: {exc}")
+
+    def _save_cumulative_reward_history(self) -> None:
+        path = self._cumulative_reward_history_path()
+        if path is None:
+            return
+        try:
+            np.savez_compressed(
+                path,
+                timesteps=np.asarray(self._cumulative_reward_timesteps, dtype=np.int64),
+                cumulative_reward=np.asarray(self._cumulative_reward_values, dtype=np.float32),
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to save cumulative reward history: {exc}")
+
+    def _save_cumulative_reward_plot(self, timestep: int, is_final: bool = False) -> None:
+        if not self.log_dir:
+            return
+        if len(self._cumulative_reward_timesteps) < 2:
+            return
+
+        checkpoint_dir = self.log_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        suffix = "final" if is_final else f"{timestep}_steps"
+        save_path = checkpoint_dir / f"cumulative_reward_{suffix}.png"
+        latest_path = checkpoint_dir / "cumulative_reward_latest.png"
+
+        try:
+            fig, ax = plt.subplots(figsize=(12, 4))
+            ax.plot(self._cumulative_reward_timesteps, self._cumulative_reward_values, color="dodgerblue", linewidth=1.5)
+            ax.set_title("Cumulative Reward vs Timesteps")
+            ax.set_xlabel("Timesteps")
+            ax.set_ylabel("Cumulative Reward")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            fig.savefig(latest_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+        except Exception as exc:
+            logger.warning(f"Failed to save cumulative reward plot: {exc}")
 
     def _save_metrics(self):
         """Save training metrics to JSON."""
@@ -551,77 +463,106 @@ class AgentTrainingLogger(BaseCallback):
 
 
 def prepare_env_data(
+    df_5m,
     df_15m,
-    df_1h,
-    df_4h,
+    df_45m,
     feature_cols: list,
-    lookback_15m: int = 20,
-    lookback_1h: int = 24,
-    lookback_4h: int = 12
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    lookback_5m: int = 48,
+    lookback_15m: int = 16,
+    lookback_45m: int = 6
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    Optional[np.ndarray],
+]:
     """
     Prepare windowed data for the trading environment.
     
-    FIXED: 1H and 4H data now correctly subsampled from the aligned 15m index.
-    Since df_1h and df_4h are aligned to the 15m index via forward-fill,
-    we subsample every 4th bar for 1H and every 16th bar for 4H.
+    FIXED: 15m and 45m data now correctly subsampled from the aligned 5m index.
+    Since df_15m and df_45m are aligned to the 5m index via forward-fill,
+    we subsample every 3rd bar for 15m and every 9th bar for 45m.
 
     Returns:
-        Tuple of (data_15m, data_1h, data_4h, close_prices, market_features)
+        Tuple of (data_5m, data_15m, data_45m, close_prices, market_features, returns)
     """
-    # Subsampling ratios: how many 15m bars per higher TF bar
-    subsample_1h = 4   # 4 x 15m = 1H
-    subsample_4h = 16  # 16 x 15m = 4H
+    # Subsampling ratios: how many 5m bars per higher TF bar
+    subsample_15m = 3   # 3 x 5m = 15m
+    subsample_45m = 9   # 9 x 5m = 45m
     
-    # Calculate valid range - need enough indices for subsampled lookback
-    start_idx = max(lookback_15m, lookback_1h * subsample_1h, lookback_4h * subsample_4h)
-    n_samples = len(df_15m) - start_idx - 1
+    # Calculate valid range accounting for subsampling.
+    # Need enough bars for: 5m lookback, (15m lookback-1)*3+1, (45m lookback-1)*9+1.
+    # This matches `src/training/precompute_analyst.py` and avoids dropping extra valid samples.
+    start_idx = max(
+        lookback_5m,
+        (lookback_15m - 1) * subsample_15m + 1,
+        (lookback_45m - 1) * subsample_45m + 1,
+    )
+    n_samples = len(df_5m) - start_idx
 
     logger.info(f"Preparing {n_samples} samples for environment")
-    logger.info(f"  15m: {lookback_15m} bars = {lookback_15m * 15 / 60:.1f} hours")
-    logger.info(f"  1H: {lookback_1h} bars = {lookback_1h} hours (using {lookback_1h * subsample_1h} aligned indices)")
-    logger.info(f"  4H: {lookback_4h} bars = {lookback_4h * 4} hours (using {lookback_4h * subsample_4h} aligned indices)")
+    logger.info(f"  5m: {lookback_5m} bars = {lookback_5m * 5 / 60:.1f} hours")
+    logger.info(f"  15m: {lookback_15m} bars = {lookback_15m * 15 / 60:.1f} hours (using {(lookback_15m - 1) * subsample_15m + 1} aligned indices)")
+    logger.info(f"  45m: {lookback_45m} bars = {lookback_45m * 45 / 60:.1f} hours (using {(lookback_45m - 1) * subsample_45m + 1} aligned indices)")
 
     # Prepare windowed data
+    data_5m = np.zeros((n_samples, lookback_5m, len(feature_cols)), dtype=np.float32)
     data_15m = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
-    data_1h = np.zeros((n_samples, lookback_1h, len(feature_cols)), dtype=np.float32)
-    data_4h = np.zeros((n_samples, lookback_4h, len(feature_cols)), dtype=np.float32)
+    data_45m = np.zeros((n_samples, lookback_45m, len(feature_cols)), dtype=np.float32)
 
+    features_5m = df_5m[feature_cols].values.astype(np.float32)
     features_15m = df_15m[feature_cols].values.astype(np.float32)
-    features_1h = df_1h[feature_cols].values.astype(np.float32)
-    features_4h = df_4h[feature_cols].values.astype(np.float32)
+    features_45m = df_45m[feature_cols].values.astype(np.float32)
 
     for i in range(n_samples):
         actual_idx = start_idx + i
-        # 15m: direct indexing (include current candle)
-        data_15m[i] = features_15m[actual_idx - lookback_15m + 1:actual_idx + 1]
+        # 5m: direct indexing (include current candle)
+        data_5m[i] = features_5m[actual_idx - lookback_5m + 1:actual_idx + 1]
 
-        # FIXED: 1H - subsample every 4th bar from aligned data, INCLUDING current candle
+        # FIXED: 15m - subsample every 3rd bar from aligned data, INCLUDING current candle
         # range() is exclusive at end, so we use actual_idx + 1 to include current
-        idx_range_1h = list(range(
-            actual_idx - (lookback_1h - 1) * subsample_1h,
+        idx_range_15m = list(range(
+            actual_idx - (lookback_15m - 1) * subsample_15m,
             actual_idx + 1,
-            subsample_1h
+            subsample_15m
         ))
-        data_1h[i] = features_1h[idx_range_1h]
+        data_15m[i] = features_15m[idx_range_15m]
 
-        # FIXED: 4H - subsample every 16th bar from aligned data, INCLUDING current candle
-        idx_range_4h = list(range(
-            actual_idx - (lookback_4h - 1) * subsample_4h,
+        # FIXED: 45m - subsample every 9th bar from aligned data, INCLUDING current candle
+        idx_range_45m = list(range(
+            actual_idx - (lookback_45m - 1) * subsample_45m,
             actual_idx + 1,
-            subsample_4h
+            subsample_45m
         ))
-        data_4h[i] = features_4h[idx_range_4h]
+        data_45m[i] = features_45m[idx_range_45m]
 
     # Close prices
-    close_prices = df_15m['close'].values[start_idx:start_idx + n_samples].astype(np.float32)
+    close_prices = df_5m['close'].values[start_idx:start_idx + n_samples].astype(np.float32)
+    
+    # Returns (for "Full Eyes" agent peripheral vision)
+    # Using 'returns' column if available, else derive from prices
+    if 'returns' in df_5m.columns:
+        returns = df_5m['returns'].values[start_idx:start_idx + n_samples].astype(np.float32)
+    else:
+        # Calculate returns on the fly
+        ret = df_5m['close'].pct_change().fillna(0).values
+        returns = ret[start_idx:start_idx + n_samples].astype(np.float32)
 
     # Market features for reward shaping (includes S/R for breakout vs chase detection)
-    market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance', 'dist_to_support', 'dist_to_resistance']
-    available_cols = [c for c in market_cols if c in df_15m.columns]
+    market_cols = [
+        'atr', 'chop', 'adx', 'regime', 'sma_distance', 
+        'dist_to_support', 'dist_to_resistance',
+        # Session timing (useful context for volatility/behavior shifts)
+        'session_asian', 'session_london', 'session_ny',
+        # Added structure features for explicit observing
+        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
+    ]
+    available_cols = [c for c in market_cols if c in df_5m.columns]
 
     if len(available_cols) > 0:
-        market_features = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+        market_features = df_5m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
     else:
         # Create dummy features if not available
         market_features = np.zeros((n_samples, 5), dtype=np.float32)
@@ -629,7 +570,7 @@ def prepare_env_data(
         market_features[:, 1] = 50.0   # Default CHOP
         market_features[:, 2] = 20.0   # Default ADX
 
-    return data_15m, data_1h, data_4h, close_prices, market_features
+    return data_5m, data_15m, data_45m, close_prices, market_features, returns
 
 
 def create_trading_env(
@@ -648,6 +589,7 @@ def create_trading_env(
     precomputed_analyst_cache: Optional[dict] = None,  # Pre-computed Analyst outputs
     ohlc_data: Optional[np.ndarray] = None,         # Real OHLC for visualization
     timestamps: Optional[np.ndarray] = None,        # Real timestamps for visualization
+    returns: Optional[np.ndarray] = None,           # Returns for Full Eyes
 ) -> TradingEnv:
     """
     Create the trading environment.
@@ -666,32 +608,40 @@ def create_trading_env(
     # Default configuration (matches config/settings.py v16 fixes)
     # FIX v16: After fixing mixed PnL units and inverted entry_price_norm,
     # these defaults now produce correct reward signals
-    spread_pips = 0.2       # Razor/Raw spread
-    slippage_pips = 0.5     # Includes commission + slippage
-    fomo_penalty = -0.5     # Moderate penalty for missing high-momentum moves
+    spread_pips = 10.0       # Razor/Raw spread
+    slippage_pips = 0.0     # Includes commission + slippage
+    fomo_penalty = 0.0     # Moderate penalty for missing high-momentum moves
     chop_penalty = 0.0      # Disabled
     fomo_threshold_atr = 4.0  # Trigger on >1.5x ATR moves
     chop_threshold = 80.0   # Only extreme chop triggers penalty
     max_steps = 500
-    reward_scaling = 0.1    # 1.0 reward per 1 pip (safe after fixing unit bugs)
+    reward_scaling = 0.01    # 1.0 reward per 1 pip (safe after fixing unit bugs)
     context_dim = 64
-    trade_entry_bonus = 0.01  # Moderate bonus (~half of entry cost)
+    trade_entry_bonus = 0.0  # Pure PnL-driven (no entry bonus)
+    noise_level = 0.01         # Default: no observation noise unless configured
 
     # Risk Management defaults
-    sl_atr_multiplier = 1.0
-    tp_atr_multiplier = 3.0
+    sl_atr_multiplier = 2.0  # v17: Tighter SL for 1:6 R:R
+    tp_atr_multiplier = 12.0
     use_stop_loss = True
     use_take_profit = True
 
-    # Volatility Sizing
+    # Volatility Sizing (Dollar-based risk)
     volatility_sizing = True
-    risk_pips_target = 15.0
+    risk_per_trade = 100.0  # Dollar risk per trade (e.g., $100 per trade)
     
     # Analyst Alignment - Force agent to trade only in analyst's predicted direction
     # DISABLED: Soft masking breaks PPO gradients - agent samples action X, gets
     # masked to Flat, but PPO updates as if X led to the reward. This causes
     # frozen action distributions and no learning.
     enforce_analyst_alignment = False
+    
+    # v16: Sparse Rewards - only reward on trade exit (not per-bar)
+    use_sparse_rewards = True  # Default: EXIT-ONLY rewards to discourage scalping
+    # v17: Loss Tolerance Buffer
+    loss_tolerance_atr = 0.5  # Allow 0.5x ATR drawdown before sparse mode kicks in
+    # v18: Minimum Hold Time
+    min_hold_bars = 24  # Must hold for 24 bars (2h) before manual exit allowed
 
     if config is not None:
         # FIX: Access config.trading for trading parameters (not config directly)
@@ -713,11 +663,20 @@ def create_trading_env(
         enforce_analyst_alignment = getattr(trading_cfg, 'enforce_analyst_alignment', enforce_analyst_alignment)
         # v15: Trade entry bonus
         trade_entry_bonus = getattr(trading_cfg, 'trade_entry_bonus', trade_entry_bonus)
+        noise_level = getattr(trading_cfg, 'noise_level', noise_level)
+        # v16: Sparse Rewards
+        use_sparse_rewards = getattr(trading_cfg, 'use_sparse_rewards', use_sparse_rewards)
+        # v17: Loss Tolerance Buffer
+        loss_tolerance_atr = getattr(trading_cfg, 'loss_tolerance_atr', loss_tolerance_atr)
+        # v18: Minimum Hold Time
+        min_hold_bars = getattr(trading_cfg, 'min_hold_bars', min_hold_bars)
 
         # Log config values to verify they're applied
         logger.info(f"Config applied: fomo_penalty={fomo_penalty}, reward_scaling={reward_scaling}, "
                     f"slippage_pips={slippage_pips}, trade_entry_bonus={trade_entry_bonus}, "
-                    f"enforce_analyst_alignment={enforce_analyst_alignment}")
+                    f"enforce_analyst_alignment={enforce_analyst_alignment}, noise_level={noise_level}, "
+                    f"use_sparse_rewards={use_sparse_rewards}, loss_tolerance_atr={loss_tolerance_atr}, "
+                    f"min_hold_bars={min_hold_bars}")
 
     if analyst_model is not None:
         context_dim = analyst_model.context_dim
@@ -727,9 +686,10 @@ def create_trading_env(
         num_classes = 2  # Default to binary
 
     env = TradingEnv(
-        data_15m=data_15m,
-        data_1h=data_1h,
-        data_4h=data_4h,
+        # Map legacy arg names to TradingEnv signature
+        data_5m=data_15m,
+        data_15m=data_1h,
+        data_45m=data_4h,
         close_prices=close_prices,
         market_features=market_features,
         analyst_model=analyst_model,
@@ -744,7 +704,7 @@ def create_trading_env(
         reward_scaling=reward_scaling,  # v15 FIX: Use local variable, not config directly
         trade_entry_bonus=trade_entry_bonus,  # v15: Exploration bonus
         device=device,
-        noise_level=getattr(config, 'noise_level', 0.01) if config else 0.0,
+        noise_level=noise_level,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
         # Risk Management
@@ -755,18 +715,27 @@ def create_trading_env(
         # Regime-balanced sampling
         regime_labels=regime_labels,
         use_regime_sampling=use_regime_sampling,
-        # Volatility Sizing
+        # Volatility Sizing (Dollar-based risk)
         volatility_sizing=volatility_sizing,
-        risk_pips_target=risk_pips_target,
+        risk_per_trade=risk_per_trade,
         # Classification mode
         num_classes=num_classes,
         # Analyst Alignment
         enforce_analyst_alignment=enforce_analyst_alignment,
+        # v16: Sparse Rewards
+        use_sparse_rewards=use_sparse_rewards,
+        # v17: Loss Tolerance Buffer
+        loss_tolerance_atr=loss_tolerance_atr,
+        # v18: Minimum Hold Time
+        min_hold_bars=min_hold_bars,
         # Pre-computed Analyst cache
         precomputed_analyst_cache=precomputed_analyst_cache,
         # Visualization data
         ohlc_data=ohlc_data,
         timestamps=timestamps,
+        # Full Eyes Features
+        returns=returns,
+        agent_lookback_window=getattr(trading_cfg, 'agent_lookback_window', 6) if config is not None else 6,
     )
 
     return env
@@ -806,31 +775,26 @@ def train_agent(
     log_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(str(log_dir), name=__name__)
 
-    # Device selection
-    if device is None:
-        if torch.backends.mps.is_available():
-            device = torch.device('mps')
-        else:
-            device = torch.device('cpu')
-
-    logger.info(f"Training agent on device: {device}")
+    # PPO/SB3 training is forced to CPU for stability and to avoid GPU/MPS usage.
+    if device is not None and getattr(device, "type", None) != "cpu":
+        logger.warning(f"Overriding requested device {device} -> cpu for PPO training.")
+    device = torch.device("cpu")
+    logger.info("Training PPO agent on device: cpu")
 
     # Load frozen analyst
     logger.info(f"Loading analyst from {analyst_path}")
-    # Use the same features as Analyst training (11 base + 7 extra = 18 features)
-    model_features = [
-        'returns', 'volatility', 'pinbar', 'engulfing', 'doji',
-        'ema_trend', 'ema_crossover', 'regime', 'sma_distance',
-        'dist_to_resistance', 'dist_to_support',
-        # Extra features added during training
-        'session_asian', 'session_london', 'session_ny',
-        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
-    ]
+    from src.live.bridge_constants import MODEL_FEATURE_COLS
+    required_feature_cols = list(MODEL_FEATURE_COLS)
+
+    if feature_cols != required_feature_cols:
+        logger.warning("Overriding `feature_cols` with canonical MODEL_FEATURE_COLS ordering.")
+        feature_cols = required_feature_cols
     
+    # TCNAnalyst expects true timeframe keys in this system
     feature_dims = {
-        '15m': len(model_features),
-        '1h': len(model_features),
-        '4h': len(model_features)
+        '5m': len(feature_cols),
+        '15m': len(feature_cols),
+        '45m': len(feature_cols)
     }
     analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
     logger.info("Analyst loaded and frozen")
@@ -856,31 +820,49 @@ def train_agent(
         for col in struct_df.columns:
             df[col] = struct_df[col]
 
-    # Update feature columns if not already included
-    session_cols = ['session_asian', 'session_london', 'session_ny']
-    struct_cols = ['bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish']
-    
-    for col in session_cols + struct_cols:
-        if col not in feature_cols:
-            feature_cols.append(col)
+    missing_cols = [
+        c for c in required_feature_cols
+        if c not in df_15m.columns or c not in df_1h.columns or c not in df_4h.columns
+    ]
+    if missing_cols:
+        raise ValueError(
+            "Missing required model feature columns after feature augmentation. "
+            "Re-run the pipeline to regenerate features.\n"
+            f"Missing: {sorted(missing_cols)}"
+        )
 
+    # NOTE: Do NOT append session/structure columns to `feature_cols` here.
+    # `feature_cols` must match what the Analyst checkpoint was trained on.
+    # Session/structure columns can still be used by the agent via `market_features`
+    # (see `prepare_env_data()`).
+
+    # NOTE: We now operate on 5m/15m/45m timeframes.
+    # train_agent() keeps legacy arg names (df_15m/df_1h/df_4h) for compatibility,
+    # but the mapping in the pipeline is:
+    #   df_15m -> 5m base
+    #   df_1h  -> 15m mid
+    #   df_4h  -> 45m high
+    lookback_5m = config.analyst.lookback_5m
     lookback_15m = config.analyst.lookback_15m
-    lookback_1h = config.analyst.lookback_1h
-    lookback_4h = config.analyst.lookback_4h
+    lookback_45m = config.analyst.lookback_45m
 
-    data_15m, data_1h, data_4h, close_prices, market_features = prepare_env_data(
+    data_15m, data_1h, data_4h, close_prices, market_features, returns = prepare_env_data(
         df_15m, df_1h, df_4h, feature_cols,
-        lookback_15m, lookback_1h, lookback_4h
+        lookback_5m, lookback_15m, lookback_45m,
     )
 
     logger.info(f"Data shapes: 15m={data_15m.shape}, 1h={data_1h.shape}, 4h={data_4h.shape}")
     logger.info(f"Price range: {close_prices.min():.5f} - {close_prices.max():.5f}")
 
     # Extract real OHLC data for visualization
-    # Calculate start_idx to match prepare_env_data
-    subsample_1h = 4
-    subsample_4h = 16
-    start_idx = max(lookback_15m, lookback_1h * subsample_1h, lookback_4h * subsample_4h)
+    # Calculate start_idx to match prepare_env_data (5m base with 15m/45m subsampling)
+    subsample_15m = 3
+    subsample_45m = 9
+    start_idx = max(
+        lookback_5m,
+        (lookback_15m - 1) * subsample_15m + 1,
+        (lookback_45m - 1) * subsample_45m + 1,
+    )
     n_samples = len(close_prices)
     
     ohlc_data = None
@@ -906,7 +888,8 @@ def train_agent(
         data_1h[:split_idx],
         data_4h[:split_idx],
         close_prices[:split_idx],
-        market_features[:split_idx]
+        market_features[:split_idx],
+        returns[:split_idx] if returns is not None else None,
     )
 
     eval_data = (
@@ -914,7 +897,8 @@ def train_agent(
         data_1h[split_idx:],
         data_4h[split_idx:],
         close_prices[split_idx:],
-        market_features[split_idx:]
+        market_features[split_idx:],
+        returns[split_idx:] if returns is not None else None,
     )
 
     # Split OHLC data for train/eval
@@ -937,7 +921,9 @@ def train_agent(
     # Compute regime labels for balanced sampling (training data only)
     # This ensures agent learns from BULLISH, BEARISH, and RANGING markets equally
     logger.info("Computing regime labels for balanced sampling...")
-    train_regime_labels = compute_regime_labels(df_15m.iloc[:split_idx], lookback=20)
+    # Align regime labels to the same trimmed segment used by the environment.
+    env_df_5m = df_15m.iloc[start_idx:start_idx + n_samples]
+    train_regime_labels = compute_regime_labels(env_df_5m.iloc[:split_idx], lookback=20)
     regime_counts = {
         'Bullish': (train_regime_labels == 0).sum(),
         'Ranging': (train_regime_labels == 1).sum(),
@@ -985,34 +971,40 @@ def train_agent(
     # Create training environment
     # FIX: ENABLE regime sampling to balance training across market regimes
     # Without this, agent sees 61% Ranging data and learns "stay flat" as default
-    # Note: Use synthetic timestamps for visualization when regime sampling is enabled
-    # to prevent chart gaps from timestamp jumps (e.g. 2022 -> 2018)
     use_regime_sampling_train = True  # ENABLED: Critical for balanced directional learning
     viz_timestamps = train_timestamps
     if use_regime_sampling_train:
         logger.info("Regime sampling ENABLED: Agent will see 33% Bullish, 33% Ranging, 33% Bearish")
-        logger.info("Using SYNTHETIC timestamps for visualization to prevent chart gaps.")
-        viz_timestamps = None
 
     train_env = create_trading_env(
-        *train_data,
+        data_15m=train_data[0],
+        data_1h=train_data[1],
+        data_4h=train_data[2],
+        close_prices=train_data[3],
+        market_features=train_data[4],
+        returns=train_data[5], # Pass returns
         analyst_model=analyst,
-        config=config.trading,
+        config=config,
         device=device,
         market_feat_mean=market_feat_mean,
         market_feat_std=market_feat_std,
-        regime_labels=train_regime_labels,  # Enable regime-balanced sampling
+        regime_labels=train_regime_labels,
         use_regime_sampling=use_regime_sampling_train,
-        precomputed_analyst_cache=train_analyst_cache,  # Use sequential context if available
-        ohlc_data=train_ohlc,          # Real OHLC for visualization
-        timestamps=viz_timestamps,    # Use synthetic timestamps if regime sampling
+        precomputed_analyst_cache=train_analyst_cache,
+        ohlc_data=train_ohlc,
+        timestamps=viz_timestamps,
     )
 
     logger.info("Creating evaluation environment...")
     eval_env = create_trading_env(
-        *eval_data,
+        data_15m=eval_data[0],
+        data_1h=eval_data[1],
+        data_4h=eval_data[2],
+        close_prices=eval_data[3],
+        market_features=eval_data[4],
+        returns=eval_data[5], # Pass returns
         analyst_model=analyst,
-        config=config.trading,
+        config=config,
         device=device,
         market_feat_mean=market_feat_mean,  # Use TRAINING stats for eval too
         market_feat_std=market_feat_std,
@@ -1035,9 +1027,46 @@ def train_agent(
     reset_timesteps = True
     remaining_timesteps = total_timesteps
 
-    if resume_path and Path(resume_path).exists():
-        logger.info(f"Resuming PPO agent from checkpoint: {resume_path}")
-        agent = SniperAgent.load(resume_path, env=train_env, device=device)
+    if resume_path:
+        resume_p = Path(str(resume_path)).expanduser()
+        if not resume_p.is_file():
+            raise FileNotFoundError(
+                f"Resume checkpoint not found (or not a file): {resume_p}\n"
+                "Expected a SB3 .zip checkpoint like: models/checkpoints/sniper_model_7400000_steps.zip"
+            )
+
+        logger.info(f"Resuming PPO agent from checkpoint: {resume_p}")
+        try:
+            agent = SniperAgent.load(str(resume_p), env=train_env, device=device)
+        except Exception as e:
+            logger.error(
+                "Failed to resume PPO from checkpoint. Most common causes:\n"
+                "- Observation space changed (e.g. added/removed features, changed `agent_lookback_window`, "
+                "or market feature columns)\n"
+                "- Action space changed\n"
+                f"Checkpoint: {resume_p}\n"
+                f"Env obs shape: {getattr(train_env.observation_space, 'shape', None)}\n"
+                f"Env action space: {train_env.action_space}\n"
+                f"Error: {e}"
+            )
+            raise
+        
+        # Force-update Exploration Rate (Entropy Coefficient) from current config
+        # This allows "shock therapy" (increasing exploration) on resumed models
+        if config is not None and hasattr(config, "agent") and hasattr(config.agent, 'ent_coef'):
+            current_ent_coef = getattr(agent.model, 'ent_coef', None)
+            new_ent_coef = config.agent.ent_coef
+            agent.model.ent_coef = new_ent_coef
+            logger.info(f"Exploration Rate (Entropy) UPDATED: {current_ent_coef} -> {new_ent_coef}")
+
+        # Force-update gamma from current config when resuming.
+        # SB3 checkpoints load hyperparameters from the saved model; this ensures
+        # the resumed run actually uses the new discount factor.
+        if config is not None and hasattr(config, "agent") and hasattr(config.agent, "gamma"):
+            current_gamma = getattr(agent.model, "gamma", None)
+            new_gamma = config.agent.gamma
+            agent.model.gamma = new_gamma
+            logger.info(f"Gamma UPDATED: {current_gamma} -> {new_gamma}")
         
         # Calculate remaining steps
         current_timesteps = agent.model.num_timesteps
@@ -1053,7 +1082,7 @@ def train_agent(
         
     else:
         logger.info("Creating PPO agent...")
-        agent = create_agent(train_env, config.agent)
+        agent = create_agent(train_env, config.agent, device=device)
         remaining_timesteps = total_timesteps
         reset_timesteps = True
 
@@ -1061,8 +1090,7 @@ def train_agent(
     training_callback = AgentTrainingLogger(
         log_dir=str(log_dir),
         log_freq=5000,
-        verbose=1,
-        enable_visualization=config.visualization.enabled
+        verbose=1
     )
 
     # Train
@@ -1115,8 +1143,6 @@ def train_agent(
     train_env.close()
     eval_env.close()
     gc.collect()
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
 
     return agent, training_info
 
@@ -1152,26 +1178,27 @@ def load_and_evaluate(
     logger.info(f"Evaluating on {n_episodes} episodes")
 
     # Load analyst
-    feature_dims = {'15m': len(feature_cols), '1h': len(feature_cols), '4h': len(feature_cols)}
+    feature_dims = {'5m': len(feature_cols), '15m': len(feature_cols), '45m': len(feature_cols)}
     analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
 
     # Prepare data (use last portion as test)
-    data_15m, data_1h, data_4h, close_prices, market_features = prepare_env_data(
+    data_15m, data_1h, data_4h, close_prices, market_features, returns = prepare_env_data(
         df_15m, df_1h, df_4h, feature_cols
     )
 
     # Use last 15% as test
     test_start = int(0.85 * len(close_prices))
-    test_data = (
-        data_15m[test_start:],
-        data_1h[test_start:],
-        data_4h[test_start:],
-        close_prices[test_start:],
-        market_features[test_start:]
-    )
-
     # Create test environment
-    test_env = create_trading_env(*test_data, analyst_model=analyst, device=device)
+    test_env = create_trading_env(
+        data_15m=data_15m[test_start:],
+        data_1h=data_1h[test_start:],
+        data_4h=data_4h[test_start:],
+        close_prices=close_prices[test_start:],
+        market_features=market_features[test_start:],
+        returns=returns[test_start:] if returns is not None else None,
+        analyst_model=analyst,
+        device=device,
+    )
     test_env = Monitor(test_env)
 
     # Load agent

@@ -38,7 +38,7 @@ def calculate_returns(equity_curve: np.ndarray) -> np.ndarray:
 def calculate_sharpe_ratio(
     returns: np.ndarray,
     risk_free_rate: float = 0.0,
-    periods_per_year: int = 252 * 96  # 15-minute bars
+    periods_per_year: int = 252 * 288  # 5-minute bars
 ) -> float:
     """
     Calculate annualized Sharpe Ratio.
@@ -64,7 +64,7 @@ def calculate_sharpe_ratio(
 def calculate_sortino_ratio(
     returns: np.ndarray,
     risk_free_rate: float = 0.0,
-    periods_per_year: int = 252 * 96,
+    periods_per_year: int = 252 * 288,
     max_value: float = 100.0  # Cap to prevent inf in logs/comparisons
 ) -> float:
     """
@@ -202,7 +202,7 @@ def calculate_average_trade(trades: List[TradeRecord]) -> Dict[str, float]:
         'avg_winner': np.mean([t.pnl_pips for t in winners]) if winners else 0.0,
         'avg_loser': np.mean([t.pnl_pips for t in losers]) if losers else 0.0,
         'avg_duration_bars': np.mean([
-            (t.exit_time - t.entry_time).total_seconds() / 900  # 15-min bars
+            (t.exit_time - t.entry_time).total_seconds() / 300  # 5-min bars
             for t in trades
         ]) if trades else 0.0
     }
@@ -258,7 +258,7 @@ def calculate_metrics(
     equity_curve: np.ndarray,
     trades: List[TradeRecord],
     initial_balance: float = 10000.0,
-    periods_per_year: int = 252 * 96
+    periods_per_year: int = 252 * 288
 ) -> Dict[str, float]:
     """
     Calculate all performance metrics.
@@ -286,6 +286,10 @@ def calculate_metrics(
         # Returns
         'total_return_pct': total_return,
         'annualized_return_pct': total_return / years if years > 0 else 0.0,
+        # NOTE: `pnl_pips` in TradeRecord excludes entry spread/slippage costs because those are
+        # deducted directly from balance when opening positions in the backtester.
+        # This cash PnL reflects the true net PnL including those costs.
+        'net_pnl_cash': float(equity_curve[-1] - initial_balance),
 
         # Risk-adjusted returns
         'sharpe_ratio': calculate_sharpe_ratio(returns, periods_per_year=periods_per_year),
@@ -351,7 +355,8 @@ def print_metrics_report(metrics: Dict[str, float], title: str = "Performance Re
     print("\n--- Returns ---")
     print(f"Total Return:        {metrics['total_return_pct']:>10.2f}%")
     print(f"Annualized Return:   {metrics['annualized_return_pct']:>10.2f}%")
-    print(f"Total PnL:           {metrics['total_pnl_pips']:>10.1f} pips")
+    print(f"Gross PnL:           {metrics['total_pnl_pips']:>10.1f} pips  (excludes spread/slippage)")
+    print(f"Net PnL:          $  {metrics.get('net_pnl_cash', 0.0):>10.2f}  (includes spread/slippage)")
 
     print("\n--- Risk-Adjusted ---")
     sortino_status = "✓" if targets['sortino_target_met'] else "✗"

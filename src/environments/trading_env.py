@@ -45,43 +45,58 @@ class TradingEnv(gym.Env):
 
     # Position sizing multipliers
     POSITION_SIZES = (0.25, 0.5, 0.75, 1.0)
+    # Reward: pure continuous mark-to-market PnL delta (no exit "banking").
+    # The agent receives PnL changes as they occur, aligning rewards with the
+    # equity curve and avoiding incentive to prematurely close to "lock in" a
+    # large pending exit reward.
+    # Holding bonus (anti-reward-hacking):
+    # - Gated: only after trade is net profitable beyond entry costs + buffer.
+    # - Progress-based: pays only when reaching new profit milestones (high-water).
+    # - Capped: max bonus per trade is a small fraction of entry cost (in reward units).
+    HOLDING_BONUS_AMOUNT = 0.01
+    HOLDING_BONUS_CAP_FRACTION_OF_ENTRY_COST = 0.2
+    HOLDING_BONUS_BUFFER_FRACTION_OF_ENTRY_COST = 1.0
+    HOLDING_BONUS_MILESTONE_PIPS = 5.0
 
     def __init__(
         self,
+        data_5m: np.ndarray,
         data_15m: np.ndarray,
-        data_1h: np.ndarray,
-        data_4h: np.ndarray,
+        data_45m: np.ndarray,
         close_prices: np.ndarray,
         market_features: np.ndarray,
         analyst_model: Optional[torch.nn.Module] = None,
         context_dim: int = 64,
-        lookback_15m: int = 48,
-        lookback_1h: int = 24,
-        lookback_4h: int = 12,
-        spread_pips: float = 0.2,     # Razor/Raw spread
-        slippage_pips: float = 0.5,   # Includes commission + slippage
-        fomo_penalty: float = -1.0,   # v15: Meaningful penalty for missing moves (was 0.0)
+        lookback_5m: int = 48,
+        lookback_15m: int = 16,
+        lookback_45m: int = 6,
+        pip_value: float = 1.0,       # NAS100: 1 point = 1.0 price movement
+        lot_size: float = 1.0,        # NAS100 CFD lot size
+        point_multiplier: float = 1.0, # Dollar per point per lot
+        spread_pips: float = 10.0,     # NAS100 typical spread
+        slippage_pips: float = 0.0,   # NAS100 slippage
+        fomo_penalty: float = 0.0,   # v15: Meaningful penalty for missing moves (was 0.0)
         chop_penalty: float = 0.0,    # Disabled for stability
-        fomo_threshold_atr: float = 1.5,  # v15: Trigger on >1.5x ATR moves (was 2.0)
+        fomo_threshold_atr: float = 4.0,  # v15: Trigger on >1.5x ATR moves (was 2.0)
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
         max_steps: int = 500,         # ~1 week for rapid regime cycling
-        reward_scaling: float = 1.0,  # v15: 1.0 per 1 pip (was 0.01 = 1.0 per 100 pips)
-        trade_entry_bonus: float = 0.5,  # v15: Bonus for opening positions to encourage exploration
+        reward_scaling: float = 0.01,  # NAS100: 1.0 per 100 points (was 1.0 per pip for EURUSD)
+        trade_entry_bonus: float = 0.01,   # NAS100: offset spread cost
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
         pre_windowed: bool = True,  # FIXED: If True, data is already windowed (start_idx=0)
         # Risk Management
-        sl_atr_multiplier: float = 1.5, # Stop Loss = ATR * multiplier
-        tp_atr_multiplier: float = 3.0, # Take Profit = ATR * multiplier
+        sl_atr_multiplier: float = 2.0, # v17: Stop Loss = ATR * 2 (tighter for 1:6 R:R)
+        tp_atr_multiplier: float = 12.0, # Take Profit = ATR * multiplier
         use_stop_loss: bool = True,     # Enable/disable stop-loss
         use_take_profit: bool = True,   # Enable/disable take-profit
         # Regime-balanced sampling
         regime_labels: Optional[np.ndarray] = None,  # 0=Bullish, 1=Ranging, 2=Bearish
         use_regime_sampling: bool = True,  # Sample episodes balanced across regimes
-        # Volatility Sizing
-        volatility_sizing: bool = True,  # Scale position size inversely to ATR
-        risk_pips_target: float = 15.0,   # Reference risk for normalization (e.g. 15 pips)
+        # Volatility Sizing (Dollar-based risk)
+        volatility_sizing: bool = True,  # Scale position size to maintain constant dollar risk
+        risk_per_trade: float = 100.0,   # Dollar risk per trade (e.g., $100 per trade)
         # Classification mode
         num_classes: int = 2,  # Binary (2) vs multi-class (3) - affects observation size
         # Analyst Alignment
@@ -92,14 +107,23 @@ class TradingEnv(gym.Env):
         ohlc_data: Optional[np.ndarray] = None,  # Shape: (n_samples, 4) with [open, high, low, close]
         timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
         noise_level: float = 0.001,  # Anti-overfitting noise (default enabled)
+        # v16: Sparse Rewards Mode
+        use_sparse_rewards: bool = True,  # If True, only give reward on trade exit (not per-bar)
+        # v17: Loss Tolerance Buffer
+        loss_tolerance_atr: float = 0.5,  # Allow this much ATR drawdown before sparse mode kicks in
+        # v18: Forced Minimum Hold Time
+        min_hold_bars: int = 6,  # Must hold for N bars before manual exit is allowed
+        # Full Eyes Features
+        returns: Optional[np.ndarray] = None, # Recent 5m log-returns
+        agent_lookback_window: int = 0, # How many return bars to see
     ):
         """
         Initialize the trading environment.
 
         Args:
+            data_5m: 5-minute feature data [num_samples, lookback_5m, features] (base timeframe)
             data_15m: 15-minute feature data [num_samples, lookback_15m, features]
-            data_1h: 1-hour feature data [num_samples, lookback_1h, features]
-            data_4h: 4-hour feature data [num_samples, lookback_4h, features]
+            data_45m: 45-minute feature data [num_samples, lookback_45m, features]
             close_prices: Close prices for PnL calculation [num_samples]
             market_features: Additional features [num_samples, n_features]
                             Expected: [atr, chop, adx, regime, sma_distance]
@@ -116,6 +140,8 @@ class TradingEnv(gym.Env):
                            This balances PnL with penalties for "Sniper" behavior.
             device: Torch device for analyst inference
             noise_level: Std dev of Gaussian noise to add to observations (0.0 = disabled)
+            returns: Raw log-returns series for Agent's peripheral vision
+            agent_lookback_window: Number of return steps to observe
         """
         super().__init__()
 
@@ -123,11 +149,15 @@ class TradingEnv(gym.Env):
         self.noise_level = noise_level 
         if self.noise_level > 0:
             print(f"Gaussian Noise Injection ENABLED: sigma={self.noise_level}")
+        self.data_5m = data_5m.astype(np.float32)
         self.data_15m = data_15m.astype(np.float32)
-        self.data_1h = data_1h.astype(np.float32)
-        self.data_4h = data_4h.astype(np.float32)
+        self.data_45m = data_45m.astype(np.float32)
         self.close_prices = close_prices.astype(np.float32)
         self.market_features = market_features.astype(np.float32)
+        
+        # New "Full Eyes" data
+        self.returns = returns.astype(np.float32) if returns is not None else None
+        self.agent_lookback_window = agent_lookback_window
         
         # OHLC data for visualization (real candle data)
         self.ohlc_data = ohlc_data  # Shape: (n_samples, 4) = [open, high, low, close]
@@ -139,11 +169,14 @@ class TradingEnv(gym.Env):
         self.context_dim = context_dim
 
         # Lookback windows
+        self.lookback_5m = lookback_5m
         self.lookback_15m = lookback_15m
-        self.lookback_1h = lookback_1h
-        self.lookback_4h = lookback_4h
+        self.lookback_45m = lookback_45m
 
         # Trading parameters
+        self.pip_value = pip_value  # NAS100: 1.0 (1 point = 1.0 price movement)
+        self.lot_size = lot_size    # NAS100 CFD lot size (1.0)
+        self.point_multiplier = point_multiplier  # Dollar per point per lot (1.0)
         self.spread_pips = spread_pips
         self.slippage_pips = slippage_pips  # Realistic execution slippage
         self.fomo_penalty = fomo_penalty
@@ -161,15 +194,21 @@ class TradingEnv(gym.Env):
         self.use_stop_loss = use_stop_loss
         self.use_take_profit = use_take_profit
         
-        # Volatility Sizing
+        # Volatility Sizing (Dollar-based risk)
         self.volatility_sizing = volatility_sizing
-        # Volatility Sizing
-        self.volatility_sizing = volatility_sizing
-        self.risk_pips_target = risk_pips_target
+        self.risk_per_trade = risk_per_trade  # Dollar risk per trade
         
         # Analyst Alignment
         self.enforce_analyst_alignment = enforce_analyst_alignment
         self.current_probs = None  # Store for action masking
+        
+        # v16: Sparse Rewards - only reward on trade exit
+        self.use_sparse_rewards = use_sparse_rewards
+        # v17: Loss Tolerance Buffer
+        self.loss_tolerance_atr = loss_tolerance_atr
+        # v18: Forced Minimum Hold Time
+        self.min_hold_bars = min_hold_bars
+        self.entry_idx = 0  # Track when position was opened
 
         # Calculate valid range FIRST (needed for regime indices)
         # FIXED: If pre_windowed=True, data is already trimmed by prepare_env_data
@@ -178,7 +217,8 @@ class TradingEnv(gym.Env):
             self.start_idx = 0
         else:
             # Only compute start_idx if using raw DataFrames (create_env_from_dataframes)
-            self.start_idx = max(lookback_15m, lookback_1h * 4, lookback_4h * 16)
+            # Subsample ratios: 15m = 3x base (5m), 45m = 9x base (5m)
+            self.start_idx = max(lookback_5m, lookback_15m * 3, lookback_45m * 9)
         
         self.end_idx = len(close_prices) - 1
         self.n_samples = self.end_idx - self.start_idx
@@ -220,8 +260,10 @@ class TradingEnv(gym.Env):
         # Multi-class (3 classes): [p_down, p_neutral, p_up, edge, confidence, uncertainty] = 6
         n_market_features = market_features.shape[1] if len(market_features.shape) > 1 else 5
         analyst_metrics_dim = 5 if num_classes == 2 else 6
-        # Added +2 for [dist_to_sl, dist_to_tp] to fix Blind Spot
-        obs_dim = context_dim + 3 + n_market_features + analyst_metrics_dim + 2
+
+        # Obs Dim = Context + Position(3) + Market + Analyst + SL/TP(2) + Returns
+        obs_dim = context_dim + 3 + n_market_features + analyst_metrics_dim + 2 + self.agent_lookback_window
+
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -257,6 +299,9 @@ class TradingEnv(gym.Env):
         self.total_pnl = 0.0
         self.trades = []
         self.prev_unrealized_pnl = 0.0  # Track for continuous PnL rewards
+        # Holding-bonus state (reset on every new trade)
+        self._holding_bonus_paid = 0.0
+        self._holding_bonus_level = 0
 
         # Precompute context vectors if analyst is provided
         self._precomputed_contexts = None
@@ -298,31 +343,38 @@ class TradingEnv(gym.Env):
                 end_i = min(i + batch_size, self.n_samples)
                 actual_indices = range(self.start_idx + i, self.start_idx + end_i)
 
-                # Get batch data
+                # Get batch data (base/mid/high)
+                batch_5m = torch.tensor(
+                    self.data_5m[list(actual_indices)],
+                    device=self.device,
+                    dtype=torch.float32
+                )
                 batch_15m = torch.tensor(
                     self.data_15m[list(actual_indices)],
                     device=self.device,
                     dtype=torch.float32
                 )
-                batch_1h = torch.tensor(
-                    self.data_1h[list(actual_indices)],
-                    device=self.device,
-                    dtype=torch.float32
-                )
-                batch_4h = torch.tensor(
-                    self.data_4h[list(actual_indices)],
+                batch_45m = torch.tensor(
+                    self.data_45m[list(actual_indices)],
                     device=self.device,
                     dtype=torch.float32
                 )
 
                 # Get context AND probabilities
                 if hasattr(self.analyst, 'get_probabilities'):
-                    context, probs = self.analyst.get_probabilities(batch_15m, batch_1h, batch_4h)
+                    res = self.analyst.get_probabilities(batch_5m, batch_15m, batch_45m)
+                    
+                    if len(res) == 3:
+                         context, probs, weights = res
+                    else:
+                         context, probs = res
+                         weights = None
+                         
                     contexts.append(context.cpu().numpy())
                     probs_list.append(probs.cpu().numpy())
                 else:
                     # Fallback for old models
-                    context = self.analyst.get_context(batch_15m, batch_1h, batch_4h)
+                    context = self.analyst.get_context(batch_5m, batch_15m, batch_45m)
                     contexts.append(context.cpu().numpy())
                     # Default probs (neutral)
                     dummy_probs = np.zeros((len(context), 3), dtype=np.float32)
@@ -330,7 +382,7 @@ class TradingEnv(gym.Env):
                     probs_list.append(dummy_probs)
 
                 # Memory cleanup
-                del batch_15m, batch_1h, batch_4h, context
+                del batch_5m, batch_15m, batch_45m, context
                 if i % (batch_size * 10) == 0:
                     if torch.backends.mps.is_available():
                         torch.mps.empty_cache()
@@ -338,7 +390,7 @@ class TradingEnv(gym.Env):
 
         self._precomputed_contexts = np.vstack(contexts).astype(np.float32)
         self._precomputed_probs = np.vstack(probs_list).astype(np.float32)
-        
+            
         print(f"Precomputed {len(self._precomputed_contexts)} context vectors and probabilities")
 
     def _get_analyst_data(self, idx: int) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[Dict[str, np.ndarray]]]:
@@ -353,7 +405,7 @@ class TradingEnv(gym.Env):
                     activations = {
                         k: v[context_idx] for k, v in self._precomputed_activations.items()
                     }
-                
+
                 return (
                     self._precomputed_contexts[context_idx],
                     self._precomputed_probs[context_idx],
@@ -364,24 +416,24 @@ class TradingEnv(gym.Env):
         if self.analyst is not None:
             # Compute on-the-fly
             with torch.no_grad():
+                x_5m = torch.tensor(
+                    self.data_5m[idx:idx+1],
+                    device=self.device,
+                    dtype=torch.float32
+                )
                 x_15m = torch.tensor(
                     self.data_15m[idx:idx+1],
                     device=self.device,
                     dtype=torch.float32
                 )
-                x_1h = torch.tensor(
-                    self.data_1h[idx:idx+1],
-                    device=self.device,
-                    dtype=torch.float32
-                )
-                x_4h = torch.tensor(
-                    self.data_4h[idx:idx+1],
+                x_45m = torch.tensor(
+                    self.data_45m[idx:idx+1],
                     device=self.device,
                     dtype=torch.float32
                 )
                 
                 if hasattr(self.analyst, 'get_activations'):
-                    context, activations = self.analyst.get_activations(x_15m, x_1h, x_4h)
+                    context, activations = self.analyst.get_activations(x_5m, x_15m, x_45m)
                     
                     # Convert activations to numpy
                     activations_np = {
@@ -390,7 +442,12 @@ class TradingEnv(gym.Env):
                     
                     # Get probs
                     if hasattr(self.analyst, 'get_probabilities'):
-                        _, probs = self.analyst.get_probabilities(x_15m, x_1h, x_4h)
+                        res = self.analyst.get_probabilities(x_5m, x_15m, x_45m)
+
+                        if isinstance(res, (tuple, list)) and len(res) == 3:
+                            _, probs, _ = res
+                        else:
+                            _, probs = res
                         probs = probs.cpu().numpy().flatten()
                     else:
                         probs = np.array([0.5, 0.5], dtype=np.float32)
@@ -399,7 +456,7 @@ class TradingEnv(gym.Env):
                 
                 elif hasattr(self.analyst, 'get_probabilities'):
                     # Check if get_probabilities returns 3 values (new version)
-                    result = self.analyst.get_probabilities(x_15m, x_1h, x_4h)
+                    result = self.analyst.get_probabilities(x_5m, x_15m, x_45m)
                     if len(result) == 3:
                         context, probs, weights = result
                         weights = weights.cpu().numpy().flatten() if weights is not None else None
@@ -408,7 +465,7 @@ class TradingEnv(gym.Env):
                         weights = None
                     return context.cpu().numpy().flatten(), probs.cpu().numpy().flatten(), weights, None
                 else:
-                    context = self.analyst.get_context(x_15m, x_1h, x_4h)
+                    context = self.analyst.get_context(x_5m, x_15m, x_45m)
                     # Dummy probs - match num_classes
                     if self.num_classes == 2:
                         probs = np.array([0.5, 0.5], dtype=np.float32)  # Binary: neutral
@@ -506,9 +563,9 @@ class TradingEnv(gym.Env):
             atr = self.market_features[self.current_idx, 0]
             if atr > 1e-8:
                 # Replicate logic from _check_stop_loss_take_profit
-                sl_pips = max((atr * self.sl_atr_multiplier) / 0.0001, 5.0)
-                tp_pips = max((atr * self.tp_atr_multiplier) / 0.0001, 5.0)
-                pip_value = 0.0001
+                sl_pips = max((atr * self.sl_atr_multiplier) / self.pip_value, 5.0)
+                tp_pips = max((atr * self.tp_atr_multiplier) / self.pip_value, 5.0)
+                pip_value = self.pip_value
                 
                 if self.position == 1: # Long
                     sl_price = self.entry_price - sl_pips * pip_value
@@ -531,7 +588,27 @@ class TradingEnv(gym.Env):
             market_feat,
             analyst_metrics,
             np.array([dist_sl_norm, dist_tp_norm], dtype=np.float32)
-        ]) # Anti-Overfitting: Inject Gaussian Noise
+        ])
+        
+        # Append "Full Eyes" features
+        if self.agent_lookback_window > 0 and self.returns is not None:
+            # Slice recent returns
+            # Use current_idx + 1 because the 'returns' array aligns with close_prices
+            # We want [t - lookback + 1 ... t]
+            idx_start = self.current_idx - self.agent_lookback_window + 1
+            idx_end = self.current_idx + 1
+            if idx_start < 0:
+                # Pad with zeros if we are at the very beginning (unlikely due to start_idx)
+                returns_slice = np.zeros(self.agent_lookback_window, dtype=np.float32)
+                valid_len = idx_end
+                returns_slice[-valid_len:] = self.returns[0:idx_end]
+            else:
+                returns_slice = self.returns[idx_start:idx_end]
+            
+            # Multiply by 100 for normalization (returns are small floats)
+            obs = np.concatenate([obs, returns_slice * 100])
+                
+        # Anti-Overfitting: Inject Gaussian Noise
         if self.noise_level > 0:
             noise = np.random.normal(0, self.noise_level, size=obs.shape).astype(np.float32)
             obs += noise
@@ -544,7 +621,7 @@ class TradingEnv(gym.Env):
             return 0.0
 
         current_price = self.close_prices[self.current_idx]
-        pip_value = 0.0001  # EURUSD pip
+        pip_value = self.pip_value  # NAS100: 1.0 per point
 
         if self.position == 1:  # Long
             pnl_pips = (current_price - self.entry_price) / pip_value
@@ -574,7 +651,7 @@ class TradingEnv(gym.Env):
 
         # Get current bar OHLC
         close_price = self.close_prices[self.current_idx]
-        pip_value = 0.0001
+        pip_value = self.pip_value  # NAS100: 1.0 per point
 
         # FIXED: Get High/Low for accurate intra-bar SL/TP detection
         if self.ohlc_data is not None:
@@ -592,9 +669,9 @@ class TradingEnv(gym.Env):
         else:
             atr = 0.001  # Default fallback
 
-        # Calculate dynamic thresholds in pips
-        sl_pips_threshold = (atr * self.sl_atr_multiplier) / 0.0001
-        tp_pips_threshold = (atr * self.tp_atr_multiplier) / 0.0001
+        # Calculate dynamic thresholds in pips/points
+        sl_pips_threshold = (atr * self.sl_atr_multiplier) / self.pip_value
+        tp_pips_threshold = (atr * self.tp_atr_multiplier) / self.pip_value
 
         # Enforce minimums (e.g. 5 pips) to prevent noise stop-outs
         sl_pips_threshold = max(sl_pips_threshold, 5.0)
@@ -633,8 +710,12 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
+                self._holding_bonus_paid = 0.0
+                self._holding_bonus_level = 0
 
-                return final_delta * self.reward_scaling, {
+                sl_reward = final_delta * self.reward_scaling
+
+                return sl_reward, {
                     'stop_loss_triggered': True,
                     'trade_closed': True,
                     'close_reason': 'stop_loss',
@@ -665,8 +746,12 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
+                self._holding_bonus_paid = 0.0
+                self._holding_bonus_level = 0
 
-                return final_delta * self.reward_scaling, {
+                tp_reward = final_delta * self.reward_scaling
+
+                return tp_reward, {
                     'take_profit_triggered': True,
                     'trade_closed': True,
                     'close_reason': 'take_profit',
@@ -702,8 +787,12 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
+                self._holding_bonus_paid = 0.0
+                self._holding_bonus_level = 0
 
-                return final_delta * self.reward_scaling, {
+                sl_reward = final_delta * self.reward_scaling
+
+                return sl_reward, {
                     'stop_loss_triggered': True,
                     'trade_closed': True,
                     'close_reason': 'stop_loss',
@@ -734,8 +823,12 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
+                self._holding_bonus_paid = 0.0
+                self._holding_bonus_level = 0
 
-                return final_delta * self.reward_scaling, {
+                tp_reward = final_delta * self.reward_scaling
+
+                return tp_reward, {
                     'take_profit_triggered': True,
                     'trade_closed': True,
                     'close_reason': 'take_profit',
@@ -803,28 +896,26 @@ class TradingEnv(gym.Env):
         
         base_size = self.POSITION_SIZES[size_idx]
         
-        # Volatility Sizing: Adjust position size so that risk is constant
-        # If ATR is high (wide SL), size should be small.
-        # If ATR is low (tight SL), size should be large.
-        # Target: SL distance * Position Size ~= Constant
+        # Dollar-Based Volatility Sizing: Maintain constant dollar risk per trade
+        # Size = Risk($) / ($/pip × SL_pips)
+        # This ensures each trade risks the same dollar amount regardless of volatility
         new_size = base_size
         
         if self.volatility_sizing and len(self.market_features.shape) > 1:
             atr = self.market_features[self.current_idx, 0]
-            # Calculate SL pips for this ATR
-            sl_pips = (atr * self.sl_atr_multiplier) / 0.0001
-            sl_pips = max(sl_pips, 5.0) # Minimum 5 pips
+            # Calculate SL distance in pips/points
+            sl_pips = (atr * self.sl_atr_multiplier) / self.pip_value
+            sl_pips = max(sl_pips, 5.0)  # Minimum 5 points
             
-            # Calculate volatility scalar
-            # Example: Target=15, SL=30 (High Vol) -> Scalar = 0.5 -> Size halved
-            # Example: Target=15, SL=7.5 (Low Vol) -> Scalar = 2.0 -> Size doubled
-            vol_scalar = self.risk_pips_target / sl_pips
+            # NAS100 dollar risk sizing:
+            # Risk($) = size(lots) × sl_pips(points) × $/point
+            # $/point per 1 lot = pip_value × lot_size × point_multiplier
+            dollars_per_pip = self.pip_value * self.lot_size * self.point_multiplier
+            risk_amount = self.risk_per_trade * base_size  # Scale risk by agent's size choice
+            new_size = risk_amount / (dollars_per_pip * sl_pips)
             
-            # Apply scalar to base size
-            new_size = base_size * vol_scalar
-            
-            # Clip to reasonable limits (e.g. 0.1x to 5.0x) to prevent extreme leverage
-            new_size = np.clip(new_size, 0.1, 5.0)
+            # Clip to reasonable limits to prevent extreme leverage
+            new_size = np.clip(new_size, 0.1, 50.0)  # Max 50 lots
 
         reward = 0.0
         info = {
@@ -846,19 +937,40 @@ class TradingEnv(gym.Env):
 
         # Calculate price move for FOMO detection
         price_move = abs(current_price - prev_price)
-        pip_value = 0.0001
+        pip_value = self.pip_value  # NAS100: 1.0 per point
 
         # Handle position changes
-        # Reward structure: Continuous pnl_delta rewards every step.
-        # On exit: The final delta (last price leg) is captured BEFORE resetting position
-        # to ensure the agent receives complete reward signal for the entire trade.
+        # Reward structure: Pure continuous PnL delta rewards every step.
+        # On close/flip: capture the final delta BEFORE resetting position so the last
+        # price leg is not missed, without paying any extra "banked" exit reward.
+        
+        # v18: MINIMUM HOLD TIME CHECK
+        # Block manual exits AND position flips before min_hold_bars have passed
+        # This prevents scalping by forcing agent to hold trades longer
+        # SL/TP are NOT affected - they are checked BEFORE this action handling
+        if self.position != 0 and self.min_hold_bars > 0:
+            bars_held = self.current_idx - self.entry_idx
+            if bars_held < self.min_hold_bars:
+                # Check if action would close or flip the position
+                would_close_or_flip = (
+                    direction == 0 or  # Flat/Exit
+                    (self.position == 1 and direction == 2) or  # Long→Short flip
+                    (self.position == -1 and direction == 1)    # Short→Long flip
+                )
+                if would_close_or_flip:
+                    # BLOCK: Force agent to keep current position
+                    direction = 1 if self.position == 1 else 2  # Keep Long/Short
+                    info['exit_blocked'] = True
+                    info['bars_held'] = bars_held
+                    info['min_hold_bars'] = self.min_hold_bars
+        
         if direction == 0:  # Flat/Exit
             if self.position != 0:
                 # CRITICAL: Calculate final delta BEFORE resetting position
                 # This captures the last price leg that would otherwise be missed
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
-                reward += final_delta * self.reward_scaling  # Capture final leg!
+                reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus was causing reward-PnL divergence
                 # The bonus (+2.5 for ANY profitable trade) was 50x larger than
@@ -884,13 +996,15 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
+                self._holding_bonus_paid = 0.0
+                self._holding_bonus_level = 0
 
         elif direction == 1:  # Long
             if self.position == -1:  # Close short first
                 # CRITICAL: Calculate final delta BEFORE resetting position
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
-                reward += final_delta * self.reward_scaling  # Capture final leg!
+                reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus (see comment in Flat/Exit case above)
 
@@ -911,11 +1025,17 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
+                self._holding_bonus_paid = 0.0
+                self._holding_bonus_level = 0
 
             if self.position != 1:  # Open long
                 self.position = 1
                 self.position_size = new_size
                 self.entry_price = current_price
+                self.entry_idx = self.current_idx  # v18: Track entry bar for min hold time
+                # Reset holding-bonus state for the new trade
+                self._holding_bonus_paid = 0.0
+                self._holding_bonus_level = 0
                 # Total execution cost = spread + slippage (realistic modeling)
                 exec_cost = (self.spread_pips + self.slippage_pips) * new_size
                 reward -= exec_cost * self.reward_scaling
@@ -934,7 +1054,7 @@ class TradingEnv(gym.Env):
                 # CRITICAL: Calculate final delta BEFORE resetting position
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
-                reward += final_delta * self.reward_scaling  # Capture final leg!
+                reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus (see comment in Flat/Exit case above)
 
@@ -955,11 +1075,17 @@ class TradingEnv(gym.Env):
                 self.position_size = 0.0
                 self.entry_price = 0.0
                 self.prev_unrealized_pnl = 0.0
+                self._holding_bonus_paid = 0.0
+                self._holding_bonus_level = 0
 
             if self.position != -1:  # Open short
                 self.position = -1
                 self.position_size = new_size
                 self.entry_price = current_price
+                self.entry_idx = self.current_idx  # v18: Track entry bar for min hold time
+                # Reset holding-bonus state for the new trade
+                self._holding_bonus_paid = 0.0
+                self._holding_bonus_level = 0
                 # Total execution cost = spread + slippage (realistic modeling)
                 exec_cost = (self.spread_pips + self.slippage_pips) * new_size
                 reward -= exec_cost * self.reward_scaling
@@ -974,8 +1100,11 @@ class TradingEnv(gym.Env):
                 info['trade_entry_bonus'] = self.trade_entry_bonus
 
         # Continuous PnL feedback: reward based on CHANGE in unrealized PnL each step.
-        # This prevents the "death spiral" where holding in chop accumulates penalties
-        # with no offsetting reward until exit.
+        # v16: DISABLED by default (use_sparse_rewards=True) because it causes scalping!
+        # v17: LOSS TOLERANCE MODE - Allow normal retracements, only cut deep losers
+        #      - Profitable trades: get per-bar reward (let winners run)
+        #      - Small drawdown (< loss_tolerance_atr): still get per-bar reward (hold through noise)
+        #      - Deep loss (> loss_tolerance_atr): NO per-bar feedback (encourage exit)
         #
         # NOTE: This block only runs for OPEN positions. On exit, the final_delta is
         # captured above BEFORE resetting position, and prev_unrealized_pnl is reset to 0.
@@ -983,13 +1112,68 @@ class TradingEnv(gym.Env):
         if self.position != 0:
             current_unrealized_pnl = self._calculate_unrealized_pnl()
             pnl_delta = current_unrealized_pnl - self.prev_unrealized_pnl
-            reward += pnl_delta * self.reward_scaling
+            
+            # Get current ATR for loss tolerance calculation
+            if len(self.market_features.shape) > 1:
+                current_atr = self.market_features[self.current_idx, 0]
+            else:
+                current_atr = 10.0  # Default ATR ~10 points for NAS100
+            
+            # Calculate loss tolerance in points (negative threshold)
+            loss_tolerance_points = -(current_atr * self.loss_tolerance_atr * self.position_size)
+            
+            # v17: Give continuous rewards when trade is:
+            # - Profitable (current_unrealized_pnl > 0), OR
+            # - Within acceptable drawdown (current_unrealized_pnl > loss_tolerance_points)
+            if not self.use_sparse_rewards:
+                # Original mode: reward all PnL changes
+                reward += pnl_delta * self.reward_scaling
+            elif current_unrealized_pnl > loss_tolerance_points:
+                # Sparse mode with loss tolerance: reward when profitable OR in acceptable drawdown
+                reward += pnl_delta * self.reward_scaling
+            # Else: deep loss beyond tolerance, no per-bar reward (encourage exit)
+
+            # Holding bonus (gated + progress-based + capped):
+            # Pay only when the trade achieves a NEW profit milestone beyond break-even.
+            # This rewards "let winners run" without incentivizing time-based farming.
+            # NOTE: Holding bonus is ALWAYS active (even in sparse mode) to encourage holds
+            if current_unrealized_pnl > 0:
+                entry_cost_points = (self.spread_pips + self.slippage_pips) * self.position_size
+                buffer_points = entry_cost_points * float(self.HOLDING_BONUS_BUFFER_FRACTION_OF_ENTRY_COST)
+                net_unrealized_pnl = current_unrealized_pnl - entry_cost_points
+
+                # Gate on being net profitable beyond costs + buffer.
+                if net_unrealized_pnl > buffer_points:
+                    milestone_points = float(self.HOLDING_BONUS_MILESTONE_PIPS) * self.position_size
+                    if milestone_points > 1e-8:
+                        # Level 0: not eligible
+                        # Level 1: just crossed buffer
+                        # Level k: crossed buffer + (k-1)*milestone_points
+                        level = int(np.floor((net_unrealized_pnl - buffer_points) / milestone_points)) + 1
+                        if level > self._holding_bonus_level:
+                            levels_gained = level - self._holding_bonus_level
+                            desired_bonus = levels_gained * float(self.HOLDING_BONUS_AMOUNT)
+
+                            entry_cost_reward = entry_cost_points * self.reward_scaling
+                            cap_reward = entry_cost_reward * float(self.HOLDING_BONUS_CAP_FRACTION_OF_ENTRY_COST)
+                            remaining = cap_reward - self._holding_bonus_paid
+
+                            if remaining > 0:
+                                paid_bonus = min(desired_bonus, remaining)
+                                reward += paid_bonus
+                                self._holding_bonus_paid += paid_bonus
+
+                            # Always update level once the milestone is reached to avoid re-paying
+                            # if the trade retraces and later re-crosses the same milestone.
+                            self._holding_bonus_level = level
             info['unrealized_pnl'] = current_unrealized_pnl
             info['pnl_delta'] = pnl_delta
             self.prev_unrealized_pnl = current_unrealized_pnl
         else:
             # Position is flat - ensure tracking is reset
             self.prev_unrealized_pnl = 0.0
+            self._holding_bonus_paid = 0.0
+            self._holding_bonus_level = 0
 
         # FOMO penalty: flat during high momentum move
         if self.position == 0:
@@ -1045,6 +1229,8 @@ class TradingEnv(gym.Env):
         self.total_pnl = 0.0
         self.trades = []
         self.prev_unrealized_pnl = 0.0  # Reset for continuous PnL tracking
+        self._holding_bonus_paid = 0.0
+        self._holding_bonus_level = 0
 
         return self._get_observation(), {}
 
@@ -1076,6 +1262,47 @@ class TradingEnv(gym.Env):
         # Check termination
         terminated = self.current_idx >= self.end_idx
         truncated = self.steps >= self.max_steps
+
+        # EPISODE BOUNDARY FIX:
+        # If the episode ends with an open position, force-close it so the final
+        # mark-to-market PnL delta is realized and trade statistics are complete.
+        if (terminated or truncated) and self.position != 0:
+            exit_idx = min(self.current_idx, len(self.close_prices) - 1)
+            exit_price = float(self.close_prices[exit_idx])
+            pip_value = self.pip_value
+
+            if self.position == 1:  # Long
+                pnl_pips = (exit_price - self.entry_price) / pip_value
+            else:  # Short
+                pnl_pips = (self.entry_price - exit_price) / pip_value
+
+            final_unrealized = pnl_pips * self.position_size
+            final_delta = final_unrealized - self.prev_unrealized_pnl
+
+            forced_close_reward = final_delta * self.reward_scaling
+            reward += forced_close_reward
+
+            self.total_pnl += final_unrealized
+            self.trades.append({
+                'entry': self.entry_price,
+                'exit': exit_price,
+                'direction': self.position,
+                'size': self.position_size,
+                'pnl': final_unrealized,
+                'close_reason': 'episode_end'
+            })
+
+            # Reset position state
+            self.position = 0
+            self.position_size = 0.0
+            self.entry_price = 0.0
+            self.prev_unrealized_pnl = 0.0
+            self._holding_bonus_paid = 0.0
+            self._holding_bonus_level = 0
+
+            info['episode_end_forced_close'] = True
+            info['episode_end_forced_close_reward'] = forced_close_reward
+            info['episode_end_forced_close_pnl'] = final_unrealized
 
         # Get new observation (guard against out-of-bounds access at episode end)
         if terminated or truncated:
@@ -1175,22 +1402,27 @@ def create_env_from_dataframes(
         feature_cols = ['open', 'high', 'low', 'close', 'atr',
                        'pinbar', 'engulfing', 'doji', 'ema_trend', 'regime']
 
-    # Get default config values
-    lookback_15m = 48
-    lookback_1h = 24
-    lookback_4h = 12
+    # Get default config values (5m/15m/45m system)
+    # We keep legacy names in the signature for compatibility, but these now mean:
+    #   df_15m -> 5m base
+    #   df_1h  -> 15m mid
+    #   df_4h  -> 45m high
+    lookback_5m = 48
+    lookback_15m = 16
+    lookback_45m = 6
 
     if config is not None:
-        lookback_15m = getattr(config, 'lookback_15m', 48)
-        lookback_1h = getattr(config, 'lookback_1h', 24)
-        lookback_4h = getattr(config, 'lookback_4h', 12)
+        # Support both new and legacy config field names
+        lookback_5m = getattr(config, 'lookback_5m', getattr(config, 'lookback_15m', lookback_5m))
+        lookback_15m = getattr(config, 'lookback_15m', getattr(config, 'lookback_1h', lookback_15m))
+        lookback_45m = getattr(config, 'lookback_45m', getattr(config, 'lookback_4h', lookback_45m))
 
-    # Subsampling ratios: how many 15m bars per higher TF bar
-    subsample_1h = 4   # 4 x 15m = 1H
-    subsample_4h = 16  # 16 x 15m = 4H
+    # Subsampling ratios: how many 5m bars per higher TF bar
+    subsample_15m = 3   # 3 x 5m = 15m
+    subsample_45m = 9   # 9 x 5m = 45m
 
     # Calculate valid range - need enough indices for subsampled lookback
-    start_idx = max(lookback_15m, lookback_1h * subsample_1h, lookback_4h * subsample_4h)
+    start_idx = max(lookback_5m, lookback_15m * subsample_15m, lookback_45m * subsample_45m)
     n_samples = len(df_15m) - start_idx
 
     # Get feature arrays
@@ -1199,29 +1431,28 @@ def create_env_from_dataframes(
     features_4h = df_4h[feature_cols].values.astype(np.float32)
 
     # Create windows for each timeframe
-    data_15m = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
-    data_1h = np.zeros((n_samples, lookback_1h, len(feature_cols)), dtype=np.float32)
-    data_4h = np.zeros((n_samples, lookback_4h, len(feature_cols)), dtype=np.float32)
+    data_15m = np.zeros((n_samples, lookback_5m, len(feature_cols)), dtype=np.float32)
+    data_1h = np.zeros((n_samples, lookback_15m, len(feature_cols)), dtype=np.float32)
+    data_4h = np.zeros((n_samples, lookback_45m, len(feature_cols)), dtype=np.float32)
 
     for i in range(n_samples):
         actual_idx = start_idx + i
         # 15m: direct indexing (includes current candle)
-        data_15m[i] = features_15m[actual_idx - lookback_15m + 1:actual_idx + 1]
+        data_15m[i] = features_15m[actual_idx - lookback_5m + 1:actual_idx + 1]
 
-        # FIXED: 1H - subsample every 4th bar from aligned data, INCLUDING current candle
-        # Note: range() is exclusive at end, so we use actual_idx + 1 to include current
+        # 15m mid timeframe: subsample every 3rd bar from aligned data
         idx_range_1h = list(range(
-            actual_idx - (lookback_1h - 1) * subsample_1h,
+            actual_idx - (lookback_15m - 1) * subsample_15m,
             actual_idx + 1,
-            subsample_1h
+            subsample_15m
         ))
         data_1h[i] = features_1h[idx_range_1h]
 
-        # FIXED: 4H - subsample every 16th bar from aligned data, INCLUDING current candle
+        # 45m high timeframe: subsample every 9th bar from aligned data
         idx_range_4h = list(range(
-            actual_idx - (lookback_4h - 1) * subsample_4h,
+            actual_idx - (lookback_45m - 1) * subsample_45m,
             actual_idx + 1,
-            subsample_4h
+            subsample_45m
         ))
         data_4h[i] = features_4h[idx_range_4h]
 
@@ -1244,23 +1475,25 @@ def create_env_from_dataframes(
     available_cols = [c for c in market_cols if c in df_15m.columns]
     market_features = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
 
-    # Extract config values (defaults match config/settings.py fixes)
-    spread_pips = 0.2  # Razor/Raw spread
+    # Extract config values (defaults for NAS100)
+    pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
+    spread_pips = 2.5  # NAS100 typical spread (was 0.2 for EURUSD)
     fomo_penalty = -0.05  # Reduced from -0.5 (was dominating PnL rewards)
     chop_penalty = -0.01  # Reduced from -0.1
     fomo_threshold_atr = 2.0  # Only trigger on significant moves
     chop_threshold = 80.0  # Only extreme chop triggers penalty
-    reward_scaling = 0.5  # Increased to make PnL signal stronger vs penalties
+    reward_scaling = 0.01  # NAS100: 1 reward per 100 points
     sl_atr_multiplier = 1.0
     tp_atr_multiplier = 3.0
     use_stop_loss = True
     use_take_profit = True
     volatility_sizing = True
-    risk_pips_target = 15.0
+    risk_per_trade = 100.0  # Dollar risk per trade
     enforce_analyst_alignment = False  # DISABLED: Soft masking breaks PPO gradients
     num_classes = 2
 
     if config is not None:
+        pip_value = getattr(config, 'pip_value', pip_value)
         spread_pips = getattr(config, 'spread_pips', spread_pips)
         fomo_penalty = getattr(config, 'fomo_penalty', fomo_penalty)
         chop_penalty = getattr(config, 'chop_penalty', chop_penalty)
@@ -1272,8 +1505,7 @@ def create_env_from_dataframes(
         use_stop_loss = getattr(config, 'use_stop_loss', use_stop_loss)
         use_take_profit = getattr(config, 'use_take_profit', use_take_profit)
         volatility_sizing = getattr(config, 'volatility_sizing', volatility_sizing)
-        risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
-        risk_pips_target = getattr(config, 'risk_pips_target', risk_pips_target)
+        risk_per_trade = getattr(config, 'risk_per_trade', risk_per_trade)
         enforce_analyst_alignment = getattr(config, 'enforce_analyst_alignment', enforce_analyst_alignment)
         noise_level = getattr(config, 'noise_level', noise_level)
 
@@ -1281,17 +1513,19 @@ def create_env_from_dataframes(
         num_classes = getattr(analyst_model, 'num_classes', 2)
 
     return TradingEnv(
-        data_15m=data_15m,
-        data_1h=data_1h,
-        data_4h=data_4h,
+        # Map legacy arg names to TradingEnv signature
+        data_5m=data_15m,
+        data_15m=data_1h,
+        data_45m=data_4h,
         close_prices=close_prices,
         market_features=market_features,
         analyst_model=analyst_model,
+        lookback_5m=lookback_5m,
         lookback_15m=lookback_15m,
-        lookback_1h=lookback_1h,
-        lookback_4h=lookback_4h,
+        lookback_45m=lookback_45m,
         device=device,
-        # Config Params
+        # Config Params (NAS100)
+        pip_value=pip_value,
         spread_pips=spread_pips,
         fomo_penalty=fomo_penalty,
         chop_penalty=chop_penalty,
@@ -1303,7 +1537,7 @@ def create_env_from_dataframes(
         use_stop_loss=use_stop_loss,
         use_take_profit=use_take_profit,
         volatility_sizing=volatility_sizing,
-        risk_pips_target=risk_pips_target,
+        risk_per_trade=risk_per_trade,
         enforce_analyst_alignment=enforce_analyst_alignment,
         num_classes=num_classes,
         # Visualization data

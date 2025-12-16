@@ -48,8 +48,8 @@ def verify_gap_removal():
         print(f"Error loading raw data: {e}")
         return
 
-    print("Resampling to 15m with fill_gaps=False...")
-    df_15m = resample_ohlcv(df_raw, '15min', fill_gaps=False)
+    print("Resampling to 15m (dropping empty bins)...")
+    df_15m = resample_ohlcv(df_raw, '15min')
     
     print(f"Resampled size: {len(df_15m)}")
     

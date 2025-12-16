@@ -11,7 +11,7 @@ by the PPO Sniper Agent.
 
 import torch
 import torch.nn as nn
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List, Union
 import gc
 
 from .encoders import TransformerEncoder, LightweightEncoder
@@ -67,51 +67,39 @@ class MarketAnalyst(nn.Module):
         self.context_dim = context_dim
         self.num_classes = num_classes
 
-        # Choose encoder type
-        EncoderClass = LightweightEncoder if use_lightweight else TransformerEncoder
-
-        # Create encoder for each timeframe
-        if use_lightweight:
-            self.encoder_15m = LightweightEncoder(
-                feature_dims.get('15m', 12),
-                hidden_dim=d_model,
-                dropout=dropout
-            )
-            self.encoder_1h = LightweightEncoder(
-                feature_dims.get('1h', 12),
-                hidden_dim=d_model,
-                dropout=dropout
-            )
-            self.encoder_4h = LightweightEncoder(
-                feature_dims.get('4h', 12),
-                hidden_dim=d_model,
-                dropout=dropout
-            )
+        # Determine timeframe keys.
+        # New system uses {'5m','15m','45m'} aligned to base 5m index.
+        # Legacy system uses {'15m','1h','4h'}.
+        if any(k in feature_dims for k in ('5m', '45m')):
+            self.timeframes: List[str] = ['5m', '15m', '45m']
         else:
-            self.encoder_15m = TransformerEncoder(
-                feature_dims.get('15m', 12),
-                d_model=d_model,
-                nhead=nhead,
-                num_layers=num_layers,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout
-            )
-            self.encoder_1h = TransformerEncoder(
-                feature_dims.get('1h', 12),
-                d_model=d_model,
-                nhead=nhead,
-                num_layers=num_layers,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout
-            )
-            self.encoder_4h = TransformerEncoder(
-                feature_dims.get('4h', 12),
-                d_model=d_model,
-                nhead=nhead,
-                num_layers=num_layers,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout
-            )
+            self.timeframes = ['15m', '1h', '4h']
+
+        # Create encoder for each timeframe dynamically
+        self.encoders = nn.ModuleDict()
+        for tf in self.timeframes:
+            input_dim = feature_dims.get(tf, next(iter(feature_dims.values())))
+            if use_lightweight:
+                self.encoders[tf] = LightweightEncoder(
+                    input_dim,
+                    hidden_dim=d_model,
+                    dropout=dropout
+                )
+            else:
+                self.encoders[tf] = TransformerEncoder(
+                    input_dim,
+                    d_model=d_model,
+                    nhead=nhead,
+                    num_layers=num_layers,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout
+                )
+
+        # Backwards-compatible aliases
+        # These always map to base/mid/high encoders regardless of key names.
+        self.encoder_15m = self.encoders[self.timeframes[0]]
+        self.encoder_1h = self.encoders[self.timeframes[1]]
+        self.encoder_4h = self.encoders[self.timeframes[2]]
 
         # Fusion layer
         self.fusion = AttentionFusion(
@@ -120,10 +108,11 @@ class MarketAnalyst(nn.Module):
             dropout=dropout
         )
 
-        # Context projection (optional, if d_model != context_dim)
-        if d_model != context_dim:
+        # Context projection (optional, if input_dim != context_dim)
+        context_input_dim = d_model
+        if context_input_dim != context_dim:
             self.context_proj = nn.Sequential(
-                nn.Linear(d_model, context_dim),
+                nn.Linear(context_input_dim, context_dim),
                 nn.LayerNorm(context_dim)
             )
         else:
@@ -232,7 +221,7 @@ class MarketAnalyst(nn.Module):
         x_1h: torch.Tensor,
         x_4h: torch.Tensor,
         return_weights: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """
         Internal method: encode all timeframes and fuse to context.
 
@@ -241,21 +230,21 @@ class MarketAnalyst(nn.Module):
             weights: Attention weights [batch, 2] (optional)
         """
         # Ensure float32
-        x_15m = x_15m.float()
-        x_1h = x_1h.float()
-        x_4h = x_4h.float()
+        x_base = x_15m.float()
+        x_mid = x_1h.float()
+        x_high = x_4h.float()
 
         # Encode each timeframe
-        enc_15m = self.encoder_15m(x_15m)  # [batch, d_model]
-        enc_1h = self.encoder_1h(x_1h)
-        enc_4h = self.encoder_4h(x_4h)
+        enc_base = self.encoder_15m(x_base)  # base timeframe
+        enc_mid = self.encoder_1h(x_mid)
+        enc_high = self.encoder_4h(x_high)
 
         # Fuse timeframes
         weights = None
         if return_weights and isinstance(self.fusion, AttentionFusion):
-            fused, weights = self.fusion.forward_with_weights(enc_15m, enc_1h, enc_4h)
+            fused, weights = self.fusion.forward_with_weights(enc_base, enc_mid, enc_high)
         else:
-            fused = self.fusion(enc_15m, enc_1h, enc_4h)  # [batch, d_model]
+            fused = self.fusion(enc_base, enc_mid, enc_high)  # [batch, d_model]
 
         # Project to context dimension
         context = self.context_proj(fused)  # [batch, context_dim]
@@ -294,10 +283,7 @@ class MarketAnalyst(nn.Module):
                           horizon_1h_logits, horizon_2h_logits)
         """
         # Encode and fuse to context
-        if return_aux: # If aux requested, we might want weights too? No, keep separate.
-            context = self._encode_and_fuse(x_15m, x_1h, x_4h)
-        else:
-            context = self._encode_and_fuse(x_15m, x_1h, x_4h)
+        context = self._encode_and_fuse(x_15m, x_1h, x_4h)
 
         # Main direction prediction (4H horizon)
         direction = self.direction_head(context)  # [batch, 1] for binary, [batch, n] for multi
@@ -368,7 +354,10 @@ class MarketAnalyst(nn.Module):
                 - weights: Attention weights [batch, 2]
         """
         # Manually call encode_and_fuse to get weights
-        context, weights = self._encode_and_fuse(x_15m, x_1h, x_4h, return_weights=True)
+        context, weights = self._encode_and_fuse(
+            x_15m, x_1h, x_4h,
+            return_weights=True
+        )
         
         # Get predictions
         direction = self.direction_head(context)
@@ -414,10 +403,10 @@ class MarketAnalyst(nn.Module):
             Attention weights [batch, 2] showing attention to 1H and 4H
         """
         with torch.no_grad():
-            enc_15m = self.encoder_15m(x_15m)
-            enc_1h = self.encoder_1h(x_1h)
-            enc_4h = self.encoder_4h(x_4h)
-            _, weights = self.fusion.forward_with_weights(enc_15m, enc_1h, enc_4h)
+            enc_base = self.encoder_15m(x_15m)
+            enc_mid = self.encoder_1h(x_1h)
+            enc_high = self.encoder_4h(x_4h)
+            _, weights = self.fusion.forward_with_weights(enc_base, enc_mid, enc_high)
         return weights
 
 
@@ -517,7 +506,7 @@ def load_analyst(
             dim_feedforward=saved_config.get('dim_feedforward', global_config.analyst.dim_feedforward),
             context_dim=saved_config.get('context_dim', global_config.analyst.context_dim),
             dropout=saved_config.get('dropout', global_config.analyst.dropout),
-            num_classes=saved_config.get('num_classes', global_config.analyst.num_classes)
+            num_classes=saved_config.get('num_classes', global_config.analyst.num_classes),
         )
     else:
         model = create_analyst(feature_dims)

@@ -24,12 +24,7 @@ matplotlib>=3.7.0
 # Progress Bars
 tqdm>=4.65.0
 
-# Real-time Dashboard
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-websockets>=12.0
-orjson>=3.9.0
-pydantic>=2.5.0
+# System utilities
 psutil>=5.9.0
 
 # Optional: For faster technical indicators (requires system installation)

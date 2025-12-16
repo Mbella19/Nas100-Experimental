@@ -6,7 +6,6 @@ This is a sophisticated **Hybrid AI Trading System** for **EURUSD**, optimized f
 **Core Philosophy:**
 *   **The Eyes (Market Analyst):** A TCN/Transformer model that "sees" the market structure and outputs a context vector.
 *   **The Trigger (Sniper Agent):** A PPO agent that uses the Analyst's context + real-time metrics to execute trades (Long, Short, Flat).
-*   **The Cockpit:** A real-time Dashboard for monitoring the "brain" of the AI.
 
 ## System Architecture
 
@@ -29,11 +28,6 @@ This is a sophisticated **Hybrid AI Trading System** for **EURUSD**, optimized f
 *   **Action Space:** `MultiDiscrete` (Direction: [Flat, Long, Short] × Size: [0.25x, 0.5x, 0.75x, 1.0x]).
 *   **Reward Function:** Continuous PnL delta (avoids "death spiral"), adjusted by FOMO and Chop penalties.
 
-### 4. Visualization Stack
-*   **Backend:** FastAPI (`visualization/server.py`) handling WebSockets.
-*   **Frontend:** Next.js 14 + Recharts (`frontend/`).
-*   **Communication:** `AgentTrainingLogger` pushes metrics -> Backend -> Frontend.
-
 ## Key Commands
 
 ### Full Pipeline
@@ -41,7 +35,7 @@ Run the complete end-to-end process (Data -> Analyst -> Agent -> Backtest):
 ```bash
 python scripts/run_pipeline.py
 ```
-*Options:* `--skip-analyst`, `--skip-agent`, `--backtest-only`, `--visualization`
+*Options:* `--skip-analyst`, `--skip-agent`, `--backtest-only`
 
 ### Individual Training
 Train the Market Analyst only:
@@ -57,16 +51,6 @@ python -m src.training.train_agent
 Run Backtest:
 ```bash
 python -m src.evaluation.backtest
-```
-
-### Visualization Dashboard
-1. Start the Dashboard Backend (and Frontend implicitly if configured):
-```bash
-python scripts/start_dashboard.py
-```
-2. (Optional) Run Frontend manually:
-```bash
-cd frontend && npm run dev
 ```
 
 ## Configuration
@@ -88,7 +72,3 @@ All settings are centralized in `config/settings.py`:
 *   **Typing:** Use Python type hints for all function arguments and returns.
 *   **Logging:** Use `src.utils.logging_config` instead of `print`.
 *   **Safety:** `TradingEnv` implements "hard" stops (SL/TP) that trigger *before* the agent's action to ensure risk management.
-
-### 3. Visualization
-*   Do not block the training loop. Use non-blocking emitters.
-*   frontend components are in `frontend/src/components/charts`.

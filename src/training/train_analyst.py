@@ -26,18 +26,21 @@ from tqdm import tqdm
 import gc
 import time
 
-from ..models.analyst import MarketAnalyst, create_analyst
-from ..models.tcn_analyst import TCNAnalyst, create_tcn_analyst
-from ..data.features import (
+from src.models.analyst import MarketAnalyst, create_analyst
+from src.models.tcn_analyst import TCNAnalyst, create_tcn_analyst
+from src.data.loader import load_ohlcv
+from src.data.features import (
+    engineer_all_features,
     create_smoothed_target,
     create_return_classes,
     create_binary_direction_target,
-    create_auxiliary_targets,
-    create_multi_horizon_targets,
     add_market_sessions,
     detect_fractals,
-    detect_structure_breaks
+    detect_structure_breaks,
+    create_auxiliary_targets
 )
+from src.data.resampler import resample_all_timeframes, align_timeframes, create_multi_timeframe_dataset
+from src.data.normalizer import normalize_multi_timeframe
 from ..utils.logging_config import TrainingLogger, get_logger
 from ..utils.metrics import (
     MetricsTracker,
@@ -45,7 +48,6 @@ from ..utils.metrics import (
     compute_gradient_norm
 )
 from ..utils.visualization import TrainingVisualizer
-from visualization.data_emitter import get_emitter
 
 logger = get_logger(__name__)
 
@@ -55,27 +57,27 @@ class MultiTimeframeDataset(Dataset):
     Dataset for multi-timeframe analyst training.
 
     Each sample contains:
-    - 15m features with lookback window
-    - 1H features with lookback window (subsampled from aligned 15m index)
-    - 4H features with lookback window (subsampled from aligned 15m index)
+    - 5m features with lookback window (base timeframe)
+    - 15m features with lookback window (subsampled from aligned 5m index)
+    - 45m features with lookback window (subsampled from aligned 5m index)
     - Direction target (binary or multi-class)
     - Optional auxiliary targets (volatility, regime)
 
-    FIXED: 1H and 4H lookbacks now correctly subsample from the aligned data
-    to get the proper temporal coverage (24 hours of 1H = 24 candles, not 24 indices).
+    FIXED: 15m and 45m lookbacks now correctly subsample from the aligned data
+    to get the proper temporal coverage.
     """
 
     def __init__(
         self,
+        df_5m: pd.DataFrame,
         df_15m: pd.DataFrame,
-        df_1h: pd.DataFrame,
-        df_4h: pd.DataFrame,
+        df_45m: pd.DataFrame,
         feature_cols: List[str],
         target: pd.Series,
         class_labels: pd.Series,
-        lookback_15m: int = 48,
-        lookback_1h: int = 24,
-        lookback_4h: int = 12,
+        lookback_5m: int = 48,
+        lookback_15m: int = 16,
+        lookback_45m: int = 6,
         valid_mask: Optional[pd.Series] = None,
         volatility_target: Optional[pd.Series] = None,
         regime_target: Optional[pd.Series] = None,
@@ -85,15 +87,15 @@ class MultiTimeframeDataset(Dataset):
     ):
         """
         Args:
-            df_15m: 15-minute DataFrame
-            df_1h: 1-hour DataFrame (aligned to 15m index via ffill)
-            df_4h: 4-hour DataFrame (aligned to 15m index via ffill)
+            df_5m: 5-minute DataFrame (base timeframe)
+            df_15m: 15-minute DataFrame (aligned to 5m index via ffill)
+            df_45m: 45-minute DataFrame (aligned to 5m index via ffill)
             feature_cols: Feature columns to use
             target: Smoothed future return target (continuous)
             class_labels: Direction labels (0=Down, 1=Up for binary; 0-4 for 5-class)
-            lookback_15m: Number of 15m candles (48 = 12 hours)
-            lookback_1h: Number of 1H candles to look back (24 = 24 hours)
-            lookback_4h: Number of 4H candles to look back (12 = 48 hours)
+            lookback_5m: Number of 5m candles (48 = 4 hours)
+            lookback_15m: Number of 15m candles to look back (16 = 4 hours)
+            lookback_45m: Number of 45m candles to look back (6 = 4.5 hours)
             valid_mask: Optional boolean mask for valid samples (from binary target)
             volatility_target: Optional volatility target for auxiliary loss
             regime_target: Optional regime target for auxiliary loss
@@ -101,19 +103,19 @@ class MultiTimeframeDataset(Dataset):
             horizon_1h_target: Optional 1H horizon binary target (for multi-horizon)
             horizon_2h_target: Optional 2H horizon binary target (for multi-horizon)
         """
+        self.lookback_5m = lookback_5m
         self.lookback_15m = lookback_15m
-        self.lookback_1h = lookback_1h
-        self.lookback_4h = lookback_4h
+        self.lookback_45m = lookback_45m
         self.is_binary = is_binary
 
-        # Subsampling ratios: how many 15m bars per higher TF bar
-        self.subsample_1h = 4   # 4 x 15m = 1H
-        self.subsample_4h = 16  # 16 x 15m = 4H
+        # Subsampling ratios: how many 5m bars per higher TF bar
+        self.subsample_15m = 3   # 3 x 5m = 15m
+        self.subsample_45m = 9   # 9 x 5m = 45m
 
         # Get feature matrices
+        self.features_5m = df_5m[feature_cols].values.astype(np.float32)
         self.features_15m = df_15m[feature_cols].values.astype(np.float32)
-        self.features_1h = df_1h[feature_cols].values.astype(np.float32)
-        self.features_4h = df_4h[feature_cols].values.astype(np.float32)
+        self.features_45m = df_45m[feature_cols].values.astype(np.float32)
         self.targets = target.values.astype(np.float32)
         self.class_labels = class_labels.values.astype(np.float32)
 
@@ -136,12 +138,12 @@ class MultiTimeframeDataset(Dataset):
             self.horizon_2h_target = None
 
         # FIXED: Calculate start index based on actual temporal coverage needed
-        # For 1H lookback: need lookback_1h * 4 indices (since data is aligned to 15m)
-        # For 4H lookback: need lookback_4h * 16 indices
+        # For 15m lookback: need lookback_15m * 3 indices (since data is aligned to 5m)
+        # For 45m lookback: need lookback_45m * 9 indices
         self.start_idx = max(
-            lookback_15m,
-            lookback_1h * self.subsample_1h,
-            lookback_4h * self.subsample_4h
+            lookback_5m,
+            lookback_15m * self.subsample_15m,
+            lookback_45m * self.subsample_45m
         )
 
         # Build valid indices based on:
@@ -160,9 +162,9 @@ class MultiTimeframeDataset(Dataset):
         self.valid_indices = np.where(self.valid_mask)[0] + self.start_idx
 
         logger.info(f"Dataset created with {len(self.valid_indices)} valid samples")
+        logger.info(f"  5m lookback: {lookback_5m} bars = {lookback_5m * 5 / 60:.1f} hours")
         logger.info(f"  15m lookback: {lookback_15m} bars = {lookback_15m * 15 / 60:.1f} hours")
-        logger.info(f"  1H lookback: {lookback_1h} bars = {lookback_1h} hours")
-        logger.info(f"  4H lookback: {lookback_4h} bars = {lookback_4h * 4} hours")
+        logger.info(f"  45m lookback: {lookback_45m} bars = {lookback_45m * 45 / 60:.1f} hours")
         if valid_mask is not None:
             n_filtered = base_mask.sum() - combined_mask.sum()
             logger.info(f"  Filtered {n_filtered} neutral/weak samples for binary mode")
@@ -173,33 +175,33 @@ class MultiTimeframeDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         """
         Returns:
-            Tuple of (x_15m, x_1h, x_4h, direction_target, volatility_target, regime_target,
+            Tuple of (x_5m, x_15m, x_45m, direction_target, volatility_target, regime_target,
                       horizon_1h_target, horizon_2h_target)
             If targets not available, they default to 0.0 or NaN
         """
         actual_idx = self.valid_indices[idx]
 
-        # Get 15m lookback window (direct indexing, includes current candle)
-        x_15m = self.features_15m[actual_idx - self.lookback_15m + 1:actual_idx + 1]
+        # Get 5m lookback window (direct indexing, includes current candle)
+        x_5m = self.features_5m[actual_idx - self.lookback_5m + 1:actual_idx + 1]
 
-        # FIXED: Get 1H lookback by subsampling every 4th bar from aligned data
-        # This gives us lookback_1h actual 1H candles worth of data, INCLUDING current candle
+        # FIXED: Get 15m lookback by subsampling every 3rd bar from aligned data
+        # This gives us lookback_15m actual 15m candles worth of data, INCLUDING current candle
         # Note: range() is exclusive at end, so we use actual_idx + 1 to include current
-        idx_range_1h = range(
-            actual_idx - (self.lookback_1h - 1) * self.subsample_1h,
+        idx_range_15m = range(
+            actual_idx - (self.lookback_15m - 1) * self.subsample_15m,
             actual_idx + 1,
-            self.subsample_1h
+            self.subsample_15m
         )
-        x_1h = self.features_1h[list(idx_range_1h)]
+        x_15m = self.features_15m[list(idx_range_15m)]
 
-        # FIXED: Get 4H lookback by subsampling every 16th bar from aligned data
-        # This gives us lookback_4h actual 4H candles worth of data, INCLUDING current candle
-        idx_range_4h = range(
-            actual_idx - (self.lookback_4h - 1) * self.subsample_4h,
+        # FIXED: Get 45m lookback by subsampling every 9th bar from aligned data
+        # This gives us lookback_45m actual 45m candles worth of data, INCLUDING current candle
+        idx_range_45m = range(
+            actual_idx - (self.lookback_45m - 1) * self.subsample_45m,
             actual_idx + 1,
-            self.subsample_4h
+            self.subsample_45m
         )
-        x_4h = self.features_4h[list(idx_range_4h)]
+        x_45m = self.features_45m[list(idx_range_45m)]
 
         # Direction target (use float for binary, long for multi-class)
         y = self.class_labels[actual_idx]
@@ -225,9 +227,9 @@ class MultiTimeframeDataset(Dataset):
             h2_target = torch.tensor(float('nan'), dtype=torch.float32)
 
         return (
+            torch.tensor(x_5m, dtype=torch.float32),
             torch.tensor(x_15m, dtype=torch.float32),
-            torch.tensor(x_1h, dtype=torch.float32),
-            torch.tensor(x_4h, dtype=torch.float32),
+            torch.tensor(x_45m, dtype=torch.float32),
             y_tensor,
             vol_target,
             regime_target,
@@ -721,7 +723,8 @@ class AnalystTrainer:
         aux_regime_weight: float = 0.2,
         gradient_accumulation_steps: int = 1,
         use_multi_horizon: bool = False,
-        horizon_weights: Optional[Dict[str, float]] = None
+        horizon_weights: Optional[Dict[str, float]] = None,
+        input_noise_std: float = 0.0
     ):
         """
         Args:
@@ -745,9 +748,11 @@ class AnalystTrainer:
             gradient_accumulation_steps: Accumulate gradients over N batches for smoother updates
             use_multi_horizon: Whether to use multi-horizon prediction (1H, 2H, 4H)
             horizon_weights: Dict mapping horizon names to loss weights (e.g., {'1h': 0.2, '2h': 0.3, '4h': 1.0})
+            input_noise_std: Std dev of Gaussian noise added to inputs during training only.
         """
         self.model = model.to(device)
         self.device = device
+        self.input_noise_std = float(input_noise_std)
         self.patience = patience
         self.cache_clear_interval = cache_clear_interval
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -865,8 +870,8 @@ class AnalystTrainer:
         if self.use_aux:
             # Volatility prediction: MSE loss (regression)
             self.aux_vol_criterion = nn.MSELoss()
-            # Regime classification: BCE loss (binary: trending vs ranging)
-            self.aux_regime_criterion = nn.BCEWithLogitsLoss()
+            # Regime classification: CrossEntropy loss (3-class: Trend, Chop, Volatile)
+            self.aux_regime_criterion = nn.CrossEntropyLoss()
             logger.info(f"Using auxiliary losses: vol_weight={aux_volatility_weight}, regime_weight={aux_regime_weight}")
 
         # Multi-horizon losses (addresses Target Mismatch)
@@ -897,9 +902,6 @@ class AnalystTrainer:
         # Batch-level tracking
         self.batch_losses = []
         self.batch_grad_norms = []
-        
-        # Data emitter for frontend visualization
-        self.emitter = get_emitter()
 
     def train_epoch(
         self,
@@ -938,7 +940,8 @@ class AnalystTrainer:
         for batch_idx, batch_data in enumerate(pbar):
             batch_start = time.time()
 
-            # Unpack batch data (8 elements: x_15m, x_1h, x_4h, targets, vol_targets, regime_targets, h1_targets, h2_targets)
+            # Unpack batch data
+            # (x_15m, x_1h, x_4h, targets, vol_targets, regime_targets, h1_targets, h2_targets)
             x_15m, x_1h, x_4h, targets, vol_targets, regime_targets, h1_targets, h2_targets = batch_data
 
             # Move to device
@@ -947,27 +950,45 @@ class AnalystTrainer:
             x_4h = x_4h.to(self.device)
             targets = targets.to(self.device)
 
+            # Input noise regularization (training only)
+            if self.input_noise_std > 0:
+                x_15m = x_15m + torch.randn_like(x_15m) * self.input_noise_std
+                x_1h = x_1h + torch.randn_like(x_1h) * self.input_noise_std
+                x_4h = x_4h + torch.randn_like(x_4h) * self.input_noise_std
+            
+            model_kwargs: dict = {}
+
             # Forward pass with optional auxiliary and multi-horizon outputs
             if self.use_aux and self.use_multi_horizon:
                 vol_targets = vol_targets.to(self.device)
                 regime_targets = regime_targets.to(self.device)
                 h1_targets = h1_targets.to(self.device)
                 h2_targets = h2_targets.to(self.device)
-                outputs = self.model(x_15m, x_1h, x_4h, return_aux=True, return_multi_horizon=True)
+                outputs = self.model(
+                    x_15m, x_1h, x_4h,
+                    return_aux=True,
+                    return_multi_horizon=True
+                )
                 # Outputs: (context, direction, volatility, regime, horizon_1h, horizon_2h)
                 _, logits, vol_pred, regime_pred, h1_logits, h2_logits = outputs
             elif self.use_aux:
                 vol_targets = vol_targets.to(self.device)
                 regime_targets = regime_targets.to(self.device)
-                _, logits, vol_pred, regime_pred = self.model(x_15m, x_1h, x_4h, return_aux=True)
+                _, logits, vol_pred, regime_pred = self.model(
+                    x_15m, x_1h, x_4h,
+                    return_aux=True
+                )
                 h1_logits, h2_logits = None, None
             elif self.use_multi_horizon:
                 h1_targets = h1_targets.to(self.device)
                 h2_targets = h2_targets.to(self.device)
-                _, logits, h1_logits, h2_logits = self.model(x_15m, x_1h, x_4h, return_multi_horizon=True)
+                _, logits, h1_logits, h2_logits = self.model(
+                    x_15m, x_1h, x_4h,
+                    return_multi_horizon=True
+                )
                 vol_pred, regime_pred = None, None
             else:
-                _, logits = self.model(x_15m, x_1h, x_4h)
+                _, logits = self.model(x_15m, x_1h, x_4h, **model_kwargs)
                 h1_logits, h2_logits, vol_pred, regime_pred = None, None, None, None
 
             # Compute main direction loss (4H horizon - primary target)
@@ -1068,28 +1089,6 @@ class AnalystTrainer:
                 'lr': f'{current_lr:.2e}'
             })
 
-            # Emit data to frontend (throttled)
-            if batch_idx % 5 == 0:  # Emit every 5 batches to avoid flooding
-                # Get activations for visualization
-                activations = None
-                if hasattr(self.model, 'get_activations'):
-                    with torch.no_grad():
-                        _, activations_tensor = self.model.get_activations(x_15m, x_1h, x_4h)
-                        # Convert tensors to lists for JSON serialization
-                        activations = {
-                            k: v[0].cpu().numpy().tolist() for k, v in activations_tensor.items()
-                        }
-
-                self.emitter.push_analyst_epoch(
-                    epoch=epoch,
-                    train_loss=loss_val,
-                    val_loss=0.0, # Not available yet
-                    train_acc=metrics_tracker.compute().get('accuracy', 0.0),
-                    learning_rate=current_lr,
-                    grad_norm=grad_norm,
-                    activations=activations
-                )
-
             # Clean up batch tensors
             del x_15m, x_1h, x_4h, targets, logits, pred_classes, loss
 
@@ -1129,7 +1128,7 @@ class AnalystTrainer:
         )
 
         for batch_data in val_loader:
-            # Unpack batch data (8 elements)
+            # Unpack batch data
             x_15m, x_1h, x_4h, targets, vol_targets, regime_targets, h1_targets, h2_targets = batch_data
 
             x_15m = x_15m.to(self.device)
@@ -1418,7 +1417,7 @@ class AnalystTrainer:
             if batch_idx >= max_batches:
                 break
 
-            # Unpack 8-element tuple (x_15m, x_1h, x_4h, targets, vol, regime, h1, h2)
+            # Unpack batch tuple
             x_15m, x_1h, x_4h, tgt, _, _, _, _ = batch_data
 
             x_15m = x_15m.to(self.device)
@@ -1484,14 +1483,15 @@ class AnalystTrainer:
                 'nhead': self.model.nhead,
                 'num_layers': self.model.num_layers,
                 'dim_feedforward': self.model.dim_feedforward,
-                'architecture': 'transformer'
+                'architecture': 'transformer',
             })
         elif hasattr(self.model, 'tcn_num_blocks'):
             # TCN specific
             model_config.update({
-                'num_blocks': self.model.tcn_num_blocks,
-                'kernel_size': self.model.tcn_kernel_size,
-                'architecture': 'tcn'
+                'tcn_num_blocks': self.model.tcn_num_blocks,
+                'tcn_kernel_size': self.model.tcn_kernel_size,
+                'tcn_num_channels': getattr(self.model, 'tcn_num_channels', None),
+                'architecture': 'tcn',
             })
 
         checkpoint = {
@@ -1797,9 +1797,11 @@ def train_analyst(
 
         # Convert to classification labels
         thresholds = getattr(config, 'class_std_thresholds', (-0.5, 0.5))
+        train_end_idx = int(len(target) * 0.85)
         class_labels, class_meta = create_return_classes(
             target,
-            class_std_thresholds=thresholds
+            class_std_thresholds=thresholds,
+            train_end_idx=train_end_idx
         )
 
         label_counts = class_labels.value_counts(dropna=True).sort_index()
@@ -1866,21 +1868,21 @@ def train_analyst(
     for col in session_cols + struct_cols:
         if col not in feature_cols:
             feature_cols.append(col)
-            
+
     # Create dataset
     logger.info("Creating dataset...")
     dataset = MultiTimeframeDataset(
         df_15m, df_1h, df_4h,
         feature_cols, target, class_labels,
-        lookback_15m=getattr(config, 'lookback_15m', 48),
-        lookback_1h=getattr(config, 'lookback_1h', 24),
-        lookback_4h=getattr(config, 'lookback_4h', 12),
+        lookback_5m=getattr(config, 'lookback_5m', 48),
+        lookback_15m=getattr(config, 'lookback_15m', 16),
+        lookback_45m=getattr(config, 'lookback_45m', 6),
         valid_mask=valid_mask,  # For binary: filter out neutral/weak samples
         volatility_target=volatility_target,  # Auxiliary target
         regime_target=regime_target,  # Auxiliary target
         is_binary=use_binary,  # Affects target tensor dtype
         horizon_1h_target=horizon_1h_target,  # Multi-horizon target (1H)
-        horizon_2h_target=horizon_2h_target   # Multi-horizon target (2H)
+        horizon_2h_target=horizon_2h_target,  # Multi-horizon target (2H)
     )
 
     # Split into train/validation using CHRONOLOGICAL split (NOT random!)
@@ -1951,9 +1953,9 @@ def train_analyst(
 
     # Create model
     feature_dims = {
+        '5m': len(feature_cols),
         '15m': len(feature_cols),
-        '1h': len(feature_cols),
-        '4h': len(feature_cols)
+        '45m': len(feature_cols)
     }
 
     # v13: Support both Transformer and TCN architectures
@@ -2011,7 +2013,8 @@ def train_analyst(
         aux_regime_weight=aux_regime_weight,
         gradient_accumulation_steps=grad_accum_steps,
         use_multi_horizon=use_multi_horizon,
-        horizon_weights=horizon_weights
+        horizon_weights=horizon_weights,
+        input_noise_std=getattr(config, 'input_noise_std', 0.0)
     )
 
     # Train
@@ -2045,15 +2048,89 @@ def train_analyst(
 
 
 if __name__ == '__main__':
-    # Run training
+    # Run training with full data pipeline
+    import sys
+    from pathlib import Path
+    
+    # Add project root to path
+    project_root = Path(__file__).parent.parent.parent
+    sys.path.insert(0, str(project_root))
+    
     from config.settings import config
+    from src.data.loader import load_ohlcv
+    from src.data.resampler import resample_all_timeframes, align_timeframes
+    from src.data.features import engineer_all_features, get_feature_columns
 
     print("=" * 60)
     print(f"Starting Analyst Training (Architecture: {config.analyst.architecture})")
     print("=" * 60)
 
-    model, history = train_analyst(config.analyst, config.paths)
+    # Step 1: Load raw data
+    print("\n[1/4] Loading raw 1-minute data...")
+    data_path = config.paths.training_data_dir / config.data.raw_file
+    df_1m = load_ohlcv(data_path, datetime_format=config.data.datetime_format)
+    print(f"  Loaded {len(df_1m):,} bars")
+
+    # Step 2: Resample to native multi-timeframes (5m/15m/45m)
+    print("\n[2/4] Resampling to multi-timeframe...")
+    resampled = resample_all_timeframes(df_1m, config.data.timeframes)
+    df_5m, df_15m, df_45m = resampled['5m'], resampled['15m'], resampled['45m']
+    print(f"  5m: {len(df_5m):,} | 15m: {len(df_15m):,} | 45m: {len(df_45m):,}")
+    del df_1m  # Free memory
+
+    # Step 3: Engineer features
+    print("\n[3/4] Engineering features...")
+    feature_config = {
+        'pinbar_wick_ratio': config.features.pinbar_wick_ratio,
+        'doji_body_ratio': config.features.doji_body_ratio,
+        'fractal_window': config.features.fractal_window,
+        'sr_lookback': config.features.sr_lookback,
+        'sma_period': config.features.sma_period,
+        'ema_fast': config.features.ema_fast,
+        'ema_slow': config.features.ema_slow,
+        'chop_period': config.features.chop_period,
+        'adx_period': config.features.adx_period,
+        'atr_period': config.features.atr_period
+    }
+    df_5m = engineer_all_features(df_5m, feature_config)
+    df_15m = engineer_all_features(df_15m, feature_config)
+    df_45m = engineer_all_features(df_45m, feature_config)
+
+    # Align higher TF features to 5m AFTER engineering
+    df_5m, df_15m, df_45m = align_timeframes(df_5m, df_15m, df_45m)
+
+    # Align timeframes - find common valid indices
+    valid_5m = ~df_5m.isna().any(axis=1)
+    valid_15m = ~df_15m.isna().any(axis=1)
+    valid_45m = ~df_45m.isna().any(axis=1)
+    common_valid = valid_5m & valid_15m & valid_45m
+
+    df_5m = df_5m[common_valid]
+    df_15m = df_15m[common_valid]
+    df_45m = df_45m[common_valid]
+    
+    feature_cols = get_feature_columns()
+    feature_cols = [c for c in feature_cols if c in df_5m.columns]
+    print(f"  Features: {len(feature_cols)} columns, {len(df_5m):,} aligned rows")
+    
+    # Step 4: Train Analyst
+    print("\n[4/4] Training Market Analyst...")
+    save_path = str(config.paths.models_analyst)
+    
+    # Map 5m/15m/45m into legacy argument names expected by train_analyst()
+    model, history = train_analyst(
+        df_15m=df_5m,
+        df_1h=df_15m,
+        df_4h=df_45m,
+        feature_cols=feature_cols,
+        save_path=save_path,
+        config=config.analyst,
+        device=config.device,
+        visualize=True
+    )
 
     print("=" * 60)
     print("Training Complete!")
+    print(f"  Best val loss: {history['best_val_loss']:.6f}")
+    print(f"  Epochs trained: {history['epochs_trained']}")
     print("=" * 60)

@@ -9,14 +9,16 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
 import gc
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 # Add project root to path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
 sys.path.append(project_root)
 
 from config.settings import Config
-from src.environments.trading_env import TradingEnv, create_env_from_dataframes
-from src.models.analyst import MarketAnalyst
+from src.environments.trading_env import create_env_from_dataframes
+from src.models.analyst import load_analyst
+from src.data.features import get_feature_columns
 
 # Configure logging
 logging.basicConfig(
@@ -117,15 +119,18 @@ class MemoryCleanupCallback(BaseCallback):
     def _on_step(self) -> bool:
         if self.n_calls % self.cleanup_freq == 0:
             gc.collect()
-            if torch.backends.mps.is_available():
+            device_type = getattr(getattr(self.model, "device", None), "type", None)
+            if device_type == "mps" and torch.backends.mps.is_available():
                 torch.mps.empty_cache()
+            elif device_type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if self.verbose > 0:
                 print(f"Memory cleanup at step {self.n_calls}")
         return True
 
 def resume_training_part2():
     config = Config()
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
     # 1. Load Pre-processed Data (Parquet)
@@ -133,65 +138,40 @@ def resume_training_part2():
     logger.info(f"Loading processed data from {data_processed_path}...")
     
     try:
+        df_5m = pd.read_parquet(data_processed_path / 'features_5m_normalized.parquet')
         df_15m = pd.read_parquet(data_processed_path / 'features_15m_normalized.parquet')
-        df_1h = pd.read_parquet(data_processed_path / 'features_1h_normalized.parquet')
-        df_4h = pd.read_parquet(data_processed_path / 'features_4h_normalized.parquet')
+        df_45m = pd.read_parquet(data_processed_path / 'features_45m_normalized.parquet')
         logger.info("Data loaded successfully.")
     except Exception as e:
         logger.error(f"Failed to load parquet files: {e}")
         return
 
     # 2. Define Feature Columns
-    model_features = [
-        'returns', 'volatility', 'pinbar', 'engulfing', 'doji',
-        'ema_trend', 'ema_crossover', 'regime', 'sma_distance',
-        'dist_to_resistance', 'dist_to_support',
-        'session_asian', 'session_london', 'session_ny',
-        'bos_bullish', 'bos_bearish', 'choch_bullish', 'choch_bearish'
-    ]
-    feature_cols = [c for c in model_features if c in df_15m.columns]
+    feature_cols = get_feature_columns()
+    feature_cols = [c for c in feature_cols if c in df_5m.columns]
     logger.info(f"Using {len(feature_cols)} features: {feature_cols}")
 
     # 3. Load Analyst Model
     logger.info("Loading analyst model...")
-    feature_dims = {'15m': 18, '1h': 18, '4h': 18}
-    
-    analyst = MarketAnalyst(
-        feature_dims=feature_dims,
-        d_model=config.analyst.d_model,
-        nhead=config.analyst.nhead,
-        num_layers=config.analyst.num_layers,
-        dim_feedforward=config.analyst.dim_feedforward,
-        context_dim=config.analyst.context_dim,
-        dropout=config.analyst.dropout,
-        num_classes=config.analyst.num_classes
-    ).to(device)
-    
-    analyst_path = os.path.join(project_root, 'models/analyst/best_model.pth')
-    if not os.path.exists(analyst_path):
-         analyst_path = os.path.join(project_root, 'models/analyst/best.pt')
-         
-    try:
-        checkpoint = torch.load(analyst_path, map_location=device)
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
-        analyst.load_state_dict(state_dict)
-        logger.info("Analyst model weights loaded successfully.")
-    except Exception as e:
-        logger.warning(f"Could not load analyst weights: {e}")
+    feature_dims = {
+        '5m': len(feature_cols),
+        '15m': len(feature_cols),
+        '45m': len(feature_cols)
+    }
 
+    analyst_path = config.paths.models_analyst / 'best.pt'
+    if not analyst_path.exists():
+        analyst_path = config.paths.models_analyst / 'best_model.pth'
+
+    analyst = load_analyst(str(analyst_path), feature_dims, device=device, freeze=True)
     analyst.eval()
-    for param in analyst.parameters():
-        param.requires_grad = False
 
     # 4. Create Environment
     logger.info("Creating environment with reduced spread (1.0 pips)...")
 
     def make_env():
         env = create_env_from_dataframes(
-            df_15m, df_1h, df_4h,
+            df_5m, df_15m, df_45m,
             analyst_model=analyst,
             feature_cols=feature_cols,
             config=config,
