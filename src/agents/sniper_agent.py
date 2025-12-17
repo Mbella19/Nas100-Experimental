@@ -50,6 +50,44 @@ def linear_schedule(initial_value: float, final_value: float = None) -> Callable
     
     return schedule
 
+
+class EntropyScheduleCallback(BaseCallback):
+    """
+    Callback to decay entropy coefficient over training.
+    
+    Starts with high entropy (exploration) and decays to low entropy (exploitation).
+    This helps the agent explore early and converge late in training.
+    """
+    
+    def __init__(
+        self, 
+        initial_ent_coef: float = 0.05,
+        final_ent_coef: float = 0.001,
+        total_timesteps: int = 100_000_000,
+        verbose: int = 0
+    ):
+        super().__init__(verbose)
+        self.initial_ent_coef = initial_ent_coef
+        self.final_ent_coef = final_ent_coef
+        self.total_timesteps = total_timesteps
+    
+    def _on_step(self) -> bool:
+        # Calculate progress (0.0 at start, 1.0 at end)
+        progress = self.num_timesteps / self.total_timesteps
+        progress = min(progress, 1.0)  # Cap at 1.0
+        
+        # Linear decay from initial to final
+        current_ent_coef = self.initial_ent_coef + progress * (self.final_ent_coef - self.initial_ent_coef)
+        
+        # Update the model's entropy coefficient
+        self.model.ent_coef = current_ent_coef
+        
+        # Log occasionally
+        if self.verbose > 0 and self.n_calls % 100_000 == 0:
+            print(f"[EntropySchedule] Step {self.num_timesteps:,}: ent_coef = {current_ent_coef:.6f}")
+        
+        return True
+
 class MemoryCleanupCallback(BaseCallback):
     """
     Callback to periodically clean up memory during training.
@@ -287,7 +325,14 @@ class SniperAgent:
         # Build callback list
         callback_list = [
             MemoryCleanupCallback(cleanup_freq=5000, verbose=self.verbose),
-            TrainingMetricsCallback(log_freq=2000, verbose=self.verbose)
+            TrainingMetricsCallback(log_freq=2000, verbose=self.verbose),
+            # Entropy Schedule: Decay from 0.05 (exploration) to 0.001 (exploitation)
+            EntropyScheduleCallback(
+                initial_ent_coef=0.05,
+                final_ent_coef=0.001,
+                total_timesteps=total_timesteps,
+                verbose=self.verbose
+            )
         ]
 
         # Add Checkpoint Callback (Save every 100k steps)
@@ -295,7 +340,7 @@ class SniperAgent:
             checkpoint_path = Path(save_path) / "checkpoints"
             checkpoint_path.mkdir(parents=True, exist_ok=True)
             callback_list.append(CheckpointCallback(
-                save_freq=100_000,
+                save_freq=500_000,  # Save every 500K steps (was 100K)
                 save_path=str(checkpoint_path),
                 name_prefix="sniper_model",
                 save_replay_buffer=False,

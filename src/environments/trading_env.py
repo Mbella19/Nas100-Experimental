@@ -73,7 +73,7 @@ class TradingEnv(gym.Env):
         pip_value: float = 1.0,       # NAS100: 1 point = 1.0 price movement
         lot_size: float = 1.0,        # NAS100 CFD lot size
         point_multiplier: float = 1.0, # Dollar per point per lot
-        spread_pips: float = 10.0,     # NAS100 typical spread
+        spread_pips: float = 3.0,     # NAS100 typical spread
         slippage_pips: float = 0.0,   # NAS100 slippage
         fomo_penalty: float = 0.0,   # v15: Meaningful penalty for missing moves (was 0.0)
         chop_penalty: float = 0.0,    # Disabled for stability

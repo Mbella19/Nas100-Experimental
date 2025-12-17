@@ -185,7 +185,7 @@ class InstrumentConfig:
 @dataclass
 class TradingConfig:
     """Trading environment configuration for NAS100."""
-    spread_pips: float = 10.0    # NAS100 spread (training value)
+    spread_pips: float = 3.0    # NAS100 spread (training value)
     slippage_pips: float = 0.0  # NAS100 slippage
 
     # Confidence filtering: Only take trades when agent probability >= threshold
@@ -196,7 +196,7 @@ class TradingConfig:
     # DISABLED: Soft masking breaks PPO gradients - agent samples action X, gets
     # masked to Flat, but PPO updates as if X led to the reward. This causes
     # frozen action distributions and no learning.
-    enforce_analyst_alignment: bool = False
+    enforce_analyst_alignment: bool = True  # Force agent to trade ONLY in analyst's predicted direction
     
     # NEW: Risk-Based Sizing (Not Fixed Lots)
     risk_multipliers: Tuple[float, ...] = (1.5, 2.0, 2.5, 3.0)
@@ -274,7 +274,7 @@ class AgentConfig:
     gamma: float = 0.999
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.0         # Disabled entropy bonus
+    ent_coef: float = 0.05        # Initial value (decays to 0.001 via EntropyScheduleCallback)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 

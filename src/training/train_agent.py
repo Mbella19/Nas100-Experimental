@@ -63,7 +63,7 @@ class AgentTrainingLogger(BaseCallback):
         self,
         log_dir: Optional[str] = None,
         log_freq: int = 1000,
-        checkpoint_plot_freq: int = 100_000,
+        checkpoint_plot_freq: int = 500_000,  # Match checkpoint save frequency
         reward_plot_downsample: int = 1_000,
         verbose: int = 1
     ):
@@ -316,20 +316,18 @@ class AgentTrainingLogger(BaseCallback):
         checkpoint_dir = self.log_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        suffix = "final" if is_final else f"{timestep}_steps"
-        save_path = checkpoint_dir / f"cumulative_reward_{suffix}.png"
+        # Single auto-updating plot (overwrites each time)
         latest_path = checkpoint_dir / "cumulative_reward_latest.png"
 
         try:
             fig, ax = plt.subplots(figsize=(12, 4))
             ax.plot(self._cumulative_reward_timesteps, self._cumulative_reward_values, color="dodgerblue", linewidth=1.5)
-            ax.set_title("Cumulative Reward vs Timesteps")
+            ax.set_title(f"Cumulative Reward vs Timesteps (Step {timestep:,})")
             ax.set_xlabel("Timesteps")
             ax.set_ylabel("Cumulative Reward")
             ax.grid(True, alpha=0.3)
             fig.tight_layout()
 
-            fig.savefig(save_path, dpi=150, bbox_inches="tight")
             fig.savefig(latest_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
         except Exception as exc:
@@ -608,7 +606,7 @@ def create_trading_env(
     # Default configuration (matches config/settings.py v16 fixes)
     # FIX v16: After fixing mixed PnL units and inverted entry_price_norm,
     # these defaults now produce correct reward signals
-    spread_pips = 10.0       # Razor/Raw spread
+    spread_pips = 3.0       # Razor/Raw spread
     slippage_pips = 0.0     # Includes commission + slippage
     fomo_penalty = 0.0     # Moderate penalty for missing high-momentum moves
     chop_penalty = 0.0      # Disabled
