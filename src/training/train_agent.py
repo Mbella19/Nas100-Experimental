@@ -641,7 +641,7 @@ def create_trading_env(
     # v17: Loss Tolerance Buffer
     loss_tolerance_atr = 0.5  # Allow 0.5x ATR drawdown before sparse mode kicks in
     # v18: Minimum Hold Time
-    min_hold_bars = 24  # Must hold for 24 bars (2h) before manual exit allowed
+    min_hold_bars = 12  # Must hold for 12 bars (1h) before manual exit/flip allowed
 
     if config is not None:
         # FIX: Access config.trading for trading parameters (not config directly)

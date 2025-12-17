@@ -236,16 +236,17 @@ class TradingConfig:
     loss_tolerance_atr: float = 1.5  # Allow 1.5x ATR drawdown before sparse mode kicks in
     
     # v18: Forced Minimum Hold Time
-    # Prevents scalping by blocking manual exit before min_hold_bars is reached
-    # Agent CANNOT close position until min_hold_bars have passed (SL/TP still work)
-    min_hold_bars: int = 24  # Must hold for 24 × 5min = 2 hours minimum
+    # Prevents scalping by blocking manual exits/flips before min_hold_bars is reached
+    # Agent CANNOT close/flip position until min_hold_bars have passed (SL/TP still work)
+    min_hold_bars: int = 12  # Must hold for 12 × 5min = 1 hour minimum
+    early_exit_profit_atr: float = 3.0  # Allow early exit if profit > 3x ATR (overrides min_hold_bars)
     
     # These are mostly unused now but keep for compatibility if needed
     use_stop_loss: bool = True
     use_take_profit: bool = True
     
     # Environment settings
-    max_steps_per_episode: int = 1500   # Increased for min_hold=24 (~62 trades/episode)
+    max_steps_per_episode: int = 1500   # Increased for min_hold=12 (~125 trades/episode)
     initial_balance: float = 10000.0
     
     # Validation
@@ -264,20 +265,20 @@ class AgentConfig:
     # FIX v15: Previous ent_coef (0.01) caused rapid policy collapse to flat.
     # For a 12-action discrete space, higher entropy is needed to maintain exploration.
     learning_rate: float = 2e-4  # Increased for batch_size=2048 (stable gradients)
-    n_steps: int = 8192         # Increased for min_hold=24 (need ~300+ trades per update)
-    batch_size: int = 2048      # Larger minibatch for 8192 n_steps
+    n_steps: int = 8192         # Large rollout for sparse rewards + min_hold_bars
+    batch_size: int = 1024      # Reduced from 2048 for smoother learning
     n_epochs: int = 10          # Reduced to prevent overfitting (was 20)
     # Higher gamma reduces discounting, helping PPO value longer holds.
     # v16: Increased to 0.999 for sparse exit-only rewards (agent must plan ahead)
     gamma: float = 0.999
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.05        # Increased to prevent catastrophic forgetting (was 0.01)
+    ent_coef: float = 0.0         # Disabled entropy bonus
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
     # Training
-    total_timesteps: int = 1_000_000_000  # 1 billion steps
+    total_timesteps: int = 500_000_000  # 500M steps (reduced from 1B to prevent overtraining)
 
     # Policy network
     # FIX v15: [64, 64] may bottleneck for 49-dim input with 12-action output

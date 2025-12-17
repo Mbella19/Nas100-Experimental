@@ -599,14 +599,13 @@ class MT5BridgeState:
         size_idx = int(action[1])
         size_idx = int(np.clip(size_idx, 0, 3))
 
-        # v18 parity: forced minimum hold time (blocks EXIT and FLIPS).
+        # v18 parity: forced minimum hold time (parity with TradingEnv/backtest: blocks EXIT and FLIPS).
         exit_blocked = False
         bars_held = 0
         min_hold_bars = int(getattr(self.system_cfg.trading, "min_hold_bars", 0))
         if position != 0 and min_hold_bars > 0 and entry_pos is not None:
             bars_held = max(0, int(pos - entry_pos))
             if bars_held < min_hold_bars:
-                # Check if action would close or flip the position
                 would_close_or_flip = (
                     direction == 0 or  # Flat/Exit
                     (position == 1 and direction == 2) or  # Long→Short flip

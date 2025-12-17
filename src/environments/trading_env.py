@@ -112,7 +112,8 @@ class TradingEnv(gym.Env):
         # v17: Loss Tolerance Buffer
         loss_tolerance_atr: float = 0.5,  # Allow this much ATR drawdown before sparse mode kicks in
         # v18: Forced Minimum Hold Time
-        min_hold_bars: int = 6,  # Must hold for N bars before manual exit is allowed
+        min_hold_bars: int = 12,  # Must hold for N bars before manual exit/flip is allowed
+        early_exit_profit_atr: float = 3.0,  # Allow early exit if profit > this ATR multiple
         # Full Eyes Features
         returns: Optional[np.ndarray] = None, # Recent 5m log-returns
         agent_lookback_window: int = 0, # How many return bars to see
@@ -208,6 +209,7 @@ class TradingEnv(gym.Env):
         self.loss_tolerance_atr = loss_tolerance_atr
         # v18: Forced Minimum Hold Time
         self.min_hold_bars = min_hold_bars
+        self.early_exit_profit_atr = early_exit_profit_atr  # Allow early exit if profit > this ATR
         self.entry_idx = 0  # Track when position was opened
 
         # Calculate valid range FIRST (needed for regime indices)
@@ -948,6 +950,8 @@ class TradingEnv(gym.Env):
         # Block manual exits AND position flips before min_hold_bars have passed
         # This prevents scalping by forcing agent to hold trades longer
         # SL/TP are NOT affected - they are checked BEFORE this action handling
+        # v19: PROFIT-BASED EARLY EXIT OVERRIDE
+        # If profit exceeds early_exit_profit_atr * ATR, allow early exit
         if self.position != 0 and self.min_hold_bars > 0:
             bars_held = self.current_idx - self.entry_idx
             if bars_held < self.min_hold_bars:
@@ -958,11 +962,31 @@ class TradingEnv(gym.Env):
                     (self.position == -1 and direction == 1)    # Short→Long flip
                 )
                 if would_close_or_flip:
-                    # BLOCK: Force agent to keep current position
-                    direction = 1 if self.position == 1 else 2  # Keep Long/Short
-                    info['exit_blocked'] = True
-                    info['bars_held'] = bars_held
-                    info['min_hold_bars'] = self.min_hold_bars
+                    # v19: Check for profit-based early exit override
+                    allow_early_exit = False
+                    if self.early_exit_profit_atr > 0:
+                        # Get current ATR
+                        if len(self.market_features.shape) > 1:
+                            current_atr = self.market_features[self.current_idx, 0]
+                        else:
+                            current_atr = 20.0  # Fallback for NAS100
+                        
+                        # Calculate unrealized profit in pips
+                        unrealized_pnl = self._calculate_unrealized_pnl()
+                        profit_threshold = self.early_exit_profit_atr * current_atr
+                        
+                        if unrealized_pnl > profit_threshold:
+                            allow_early_exit = True
+                            info['early_exit_profit'] = True
+                            info['profit_pips'] = unrealized_pnl
+                            info['profit_threshold'] = profit_threshold
+                    
+                    if not allow_early_exit:
+                        # BLOCK: Force agent to keep current position
+                        direction = 1 if self.position == 1 else 2  # Keep Long/Short
+                        info['exit_blocked'] = True
+                        info['bars_held'] = bars_held
+                        info['min_hold_bars'] = self.min_hold_bars
         
         if direction == 0:  # Flat/Exit
             if self.position != 0:

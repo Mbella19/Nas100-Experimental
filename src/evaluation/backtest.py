@@ -62,7 +62,7 @@ class Backtester:
         volatility_sizing: bool = True,
         risk_per_trade: float = 100.0,   # Dollar risk per trade (e.g., $100 per trade)
         # v18: Minimum Hold Time
-        min_hold_bars: int = 6  # Must hold for N bars before manual exit allowed
+        min_hold_bars: int = 12  # Must hold for N bars before manual exit/flip allowed
     ):
         """
         Args:
@@ -75,7 +75,7 @@ class Backtester:
             use_stop_loss: Enable/disable stop-loss mechanism
             use_take_profit: Enable/disable take-profit mechanism
             risk_per_trade: Dollar risk per trade for volatility sizing
-            min_hold_bars: Minimum bars to hold before agent can manually exit
+            min_hold_bars: Minimum bars to hold before agent can manually exit/flip
         """
         self.initial_balance = initial_balance
         self.pip_value = pip_value
@@ -339,13 +339,12 @@ class Backtester:
             pnl += sl_tp_pnl
             # Position is now flat after SL/TP, agent can still open new position
 
-        # v18: MINIMUM HOLD TIME CHECK
-        # Block manual exits AND position flips before min_hold_bars have passed
-        # SL/TP are NOT affected - they are checked BEFORE this
+        # v18: MINIMUM HOLD TIME CHECK (parity with TradingEnv)
+        # Block manual exits AND position flips before min_hold_bars have passed since entry.
+        # SL/TP are NOT affected - they are checked BEFORE this.
         if self.position != 0 and self.min_hold_bars > 0:
             bars_held = self.current_step - self.entry_step
             if bars_held < self.min_hold_bars:
-                # Check if action would close or flip the position
                 would_close_or_flip = (
                     direction == 0 or  # Flat/Exit
                     (self.position == 1 and direction == 2) or  # Long→Short flip
@@ -354,6 +353,7 @@ class Backtester:
                 if would_close_or_flip:
                     # BLOCK: Force agent to keep current position
                     direction = 1 if self.position == 1 else 2  # Keep Long/Short
+                    action[0] = direction
 
         # Handle agent's action
         if direction == 0:  # Flat/Exit
@@ -420,7 +420,7 @@ def run_backtest(
     min_action_confidence: float = 0.0,
     spread_pips: float = 1.5,
     # v18: Minimum Hold Time
-    min_hold_bars: int = 6
+    min_hold_bars: int = 12
 ) -> BacktestResult:
     """
     Run a full backtest with the trained agent.
@@ -442,7 +442,7 @@ def run_backtest(
         use_take_profit: Enable/disable take-profit mechanism
         min_action_confidence: Minimum confidence threshold for trades (0.0=disabled)
         spread_pips: Spread cost per trade in pips
-        min_hold_bars: Minimum bars to hold before agent can manually exit
+        min_hold_bars: Minimum bars to hold before agent can manually exit/flip
 
     Returns:
         BacktestResult with all metrics and trades
