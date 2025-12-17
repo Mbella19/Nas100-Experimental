@@ -114,6 +114,7 @@ class TradingEnv(gym.Env):
         # v18: Forced Minimum Hold Time
         min_hold_bars: int = 12,  # Must hold for N bars before manual exit/flip is allowed
         early_exit_profit_atr: float = 3.0,  # Allow early exit if profit > this ATR multiple
+        break_even_atr: float = 2.0,  # Move SL to break-even when profit reaches this ATR
         # Full Eyes Features
         returns: Optional[np.ndarray] = None, # Recent 5m log-returns
         agent_lookback_window: int = 0, # How many return bars to see
@@ -210,6 +211,8 @@ class TradingEnv(gym.Env):
         # v18: Forced Minimum Hold Time
         self.min_hold_bars = min_hold_bars
         self.early_exit_profit_atr = early_exit_profit_atr  # Allow early exit if profit > this ATR
+        self.break_even_atr = break_even_atr  # v20: Move SL to break-even at this profit
+        self.break_even_activated = False  # Track if break-even has been triggered
         self.entry_idx = 0  # Track when position was opened
 
         # Calculate valid range FIRST (needed for regime indices)
@@ -304,6 +307,7 @@ class TradingEnv(gym.Env):
         # Holding-bonus state (reset on every new trade)
         self._holding_bonus_paid = 0.0
         self._holding_bonus_level = 0
+        self.break_even_activated = False  # v20: Reset break-even flag
 
         # Precompute context vectors if analyst is provided
         self._precomputed_contexts = None
@@ -679,6 +683,17 @@ class TradingEnv(gym.Env):
         sl_pips_threshold = max(sl_pips_threshold, 5.0)
         tp_pips_threshold = max(tp_pips_threshold, 5.0)
 
+        # v20: BREAK-EVEN STOP LOSS
+        # If profit reaches break_even_atr * ATR, move SL to entry price
+        break_even_profit_pips = (atr * self.break_even_atr) / self.pip_value
+        current_unrealized = self._calculate_unrealized_pnl()
+        
+        if self.break_even_atr > 0 and current_unrealized >= break_even_profit_pips:
+            if not self.break_even_activated:
+                self.break_even_activated = True  # Lock in break-even
+            # Override SL to break-even (entry price = 0 pips loss)
+            sl_pips_threshold = 0.0  # SL at entry price
+
         # Calculate SL/TP price levels
         if self.position == 1:  # Long
             sl_price = self.entry_price - sl_pips_threshold * pip_value
@@ -714,6 +729,7 @@ class TradingEnv(gym.Env):
                 self.prev_unrealized_pnl = 0.0
                 self._holding_bonus_paid = 0.0
                 self._holding_bonus_level = 0
+                self.break_even_activated = False  # v20: Reset break-even
 
                 sl_reward = final_delta * self.reward_scaling
 

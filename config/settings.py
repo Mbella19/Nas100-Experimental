@@ -240,6 +240,7 @@ class TradingConfig:
     # Agent CANNOT close/flip position until min_hold_bars have passed (SL/TP still work)
     min_hold_bars: int = 12  # Must hold for 12 × 5min = 1 hour minimum
     early_exit_profit_atr: float = 3.0  # Allow early exit if profit > 3x ATR (overrides min_hold_bars)
+    break_even_atr: float = 2.0  # Move SL to break-even when profit reaches 2x ATR
     
     # These are mostly unused now but keep for compatibility if needed
     use_stop_loss: bool = True
