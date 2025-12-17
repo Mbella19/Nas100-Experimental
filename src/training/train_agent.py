@@ -642,6 +642,10 @@ def create_trading_env(
     loss_tolerance_atr = 0.5  # Allow 0.5x ATR drawdown before sparse mode kicks in
     # v18: Minimum Hold Time
     min_hold_bars = 12  # Must hold for 12 bars (1h) before manual exit/flip allowed
+    # v19: Profit-based early exit override
+    early_exit_profit_atr = 3.0  # Allow early exit if profit > 3x ATR
+    # v20: Break-even stop loss
+    break_even_atr = 2.0  # Move SL to break-even when profit reaches 2x ATR
 
     if config is not None:
         # FIX: Access config.trading for trading parameters (not config directly)
@@ -670,6 +674,10 @@ def create_trading_env(
         loss_tolerance_atr = getattr(trading_cfg, 'loss_tolerance_atr', loss_tolerance_atr)
         # v18: Minimum Hold Time
         min_hold_bars = getattr(trading_cfg, 'min_hold_bars', min_hold_bars)
+        # v19: Profit-based early exit override
+        early_exit_profit_atr = getattr(trading_cfg, 'early_exit_profit_atr', early_exit_profit_atr)
+        # v20: Break-even stop loss
+        break_even_atr = getattr(trading_cfg, 'break_even_atr', break_even_atr)
 
         # Log config values to verify they're applied
         logger.info(f"Config applied: fomo_penalty={fomo_penalty}, reward_scaling={reward_scaling}, "
@@ -728,6 +736,10 @@ def create_trading_env(
         loss_tolerance_atr=loss_tolerance_atr,
         # v18: Minimum Hold Time
         min_hold_bars=min_hold_bars,
+        # v19: Profit-based early exit override
+        early_exit_profit_atr=early_exit_profit_atr,
+        # v20: Break-even stop loss
+        break_even_atr=break_even_atr,
         # Pre-computed Analyst cache
         precomputed_analyst_cache=precomputed_analyst_cache,
         # Visualization data

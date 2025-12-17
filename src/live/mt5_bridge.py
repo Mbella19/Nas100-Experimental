@@ -600,9 +600,12 @@ class MT5BridgeState:
         size_idx = int(np.clip(size_idx, 0, 3))
 
         # v18 parity: forced minimum hold time (parity with TradingEnv/backtest: blocks EXIT and FLIPS).
+        # v19 parity: profit-based early exit override
         exit_blocked = False
         bars_held = 0
         min_hold_bars = int(getattr(self.system_cfg.trading, "min_hold_bars", 0))
+        early_exit_profit_atr = float(getattr(self.system_cfg.trading, "early_exit_profit_atr", 3.0))
+        
         if position != 0 and min_hold_bars > 0 and entry_pos is not None:
             bars_held = max(0, int(pos - entry_pos))
             if bars_held < min_hold_bars:
@@ -612,13 +615,32 @@ class MT5BridgeState:
                     (position == -1 and direction == 1)    # Short→Long flip
                 )
                 if would_close_or_flip:
-                    direction = 1 if position == 1 else 2
-                    exit_blocked = True
-                    obs_info["exit_blocked"] = True
-                    obs_info["bars_held"] = int(bars_held)
-                    obs_info["min_hold_bars"] = int(min_hold_bars)
-                    if entry_label_utc is not None:
-                        obs_info["entry_label_utc"] = int(entry_label_utc.timestamp())
+                    # v19: Check for profit-based early exit override
+                    allow_early_exit = False
+                    if early_exit_profit_atr > 0 and entry_price > 0:
+                        atr_check = float(market_feat_row[0])
+                        pip_value_check = float(self.system_cfg.instrument.pip_value)
+                        current_price = current_close
+                        
+                        if position == 1:  # Long
+                            unrealized_pnl = (current_price - entry_price) / pip_value_check
+                        else:  # Short
+                            unrealized_pnl = (entry_price - current_price) / pip_value_check
+                        
+                        profit_threshold = early_exit_profit_atr * atr_check
+                        if unrealized_pnl > profit_threshold:
+                            allow_early_exit = True
+                            obs_info["early_exit_profit"] = True
+                            obs_info["profit_pips"] = float(unrealized_pnl)
+                    
+                    if not allow_early_exit:
+                        direction = 1 if position == 1 else 2
+                        exit_blocked = True
+                        obs_info["exit_blocked"] = True
+                        obs_info["bars_held"] = int(bars_held)
+                        obs_info["min_hold_bars"] = int(min_hold_bars)
+                        if entry_label_utc is not None:
+                            obs_info["entry_label_utc"] = int(entry_label_utc.timestamp())
 
         atr = float(market_feat_row[0])
         pip_value = float(self.system_cfg.instrument.pip_value)

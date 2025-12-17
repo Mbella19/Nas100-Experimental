@@ -62,7 +62,11 @@ class Backtester:
         volatility_sizing: bool = True,
         risk_per_trade: float = 100.0,   # Dollar risk per trade (e.g., $100 per trade)
         # v18: Minimum Hold Time
-        min_hold_bars: int = 12  # Must hold for N bars before manual exit/flip allowed
+        min_hold_bars: int = 12,  # Must hold for N bars before manual exit/flip allowed
+        # v19: Profit-based early exit override
+        early_exit_profit_atr: float = 3.0,  # Allow early exit if profit > this ATR multiple
+        # v20: Break-even stop loss
+        break_even_atr: float = 2.0  # Move SL to break-even when profit reaches this ATR
     ):
         """
         Args:
@@ -76,6 +80,8 @@ class Backtester:
             use_take_profit: Enable/disable take-profit mechanism
             risk_per_trade: Dollar risk per trade for volatility sizing
             min_hold_bars: Minimum bars to hold before agent can manually exit/flip
+            early_exit_profit_atr: Allow early exit if profit exceeds this ATR multiple
+            break_even_atr: Move SL to break-even when profit reaches this ATR multiple
         """
         self.initial_balance = initial_balance
         self.pip_value = pip_value
@@ -94,6 +100,11 @@ class Backtester:
         
         # v18: Minimum Hold Time
         self.min_hold_bars = min_hold_bars
+        # v19: Profit-based early exit override
+        self.early_exit_profit_atr = early_exit_profit_atr
+        # v20: Break-even stop loss
+        self.break_even_atr = break_even_atr
+        self.break_even_activated = False  # Track if break-even is activated for current trade
 
         # State
         self.balance = initial_balance
@@ -181,6 +192,7 @@ class Backtester:
         self.position_size = 0.0
         self.entry_price = 0.0
         self.entry_time = None
+        self.break_even_activated = False  # v20: Reset break-even flag
 
         return pnl_pips_sized  # Return sized pips for consistency
 
@@ -237,6 +249,22 @@ class Backtester:
         # Ensure minimum values
         sl_pips_threshold = max(sl_pips_threshold, 5.0)
         tp_pips_threshold = max(tp_pips_threshold, 5.0)
+
+        # v20: BREAK-EVEN STOP LOSS
+        # If profit reaches break_even_atr * ATR, move SL to entry price
+        if self.break_even_atr > 0 and self.position != 0:
+            # Calculate current unrealized PnL
+            if self.position == 1:  # Long
+                unrealized_pnl = (close - self.entry_price) / self.pip_value * self.position_size
+            else:  # Short
+                unrealized_pnl = (self.entry_price - close) / self.pip_value * self.position_size
+            
+            break_even_profit_pips = self.break_even_atr * atr
+            if unrealized_pnl >= break_even_profit_pips:
+                if not self.break_even_activated:
+                    self.break_even_activated = True
+                # Override SL to break-even (entry price = 0 pips loss)
+                sl_pips_threshold = 0.0  # SL at entry price
 
         # Calculate SL/TP price levels
         pip_value = self.pip_value
@@ -342,6 +370,8 @@ class Backtester:
         # v18: MINIMUM HOLD TIME CHECK (parity with TradingEnv)
         # Block manual exits AND position flips before min_hold_bars have passed since entry.
         # SL/TP are NOT affected - they are checked BEFORE this.
+        # v19: PROFIT-BASED EARLY EXIT OVERRIDE
+        # If profit exceeds early_exit_profit_atr * ATR, allow early exit
         if self.position != 0 and self.min_hold_bars > 0:
             bars_held = self.current_step - self.entry_step
             if bars_held < self.min_hold_bars:
@@ -351,9 +381,23 @@ class Backtester:
                     (self.position == -1 and direction == 1)    # Short→Long flip
                 )
                 if would_close_or_flip:
-                    # BLOCK: Force agent to keep current position
-                    direction = 1 if self.position == 1 else 2  # Keep Long/Short
-                    action[0] = direction
+                    # v19: Check for profit-based early exit override
+                    allow_early_exit = False
+                    if self.early_exit_profit_atr > 0:
+                        # Calculate current unrealized PnL
+                        if self.position == 1:  # Long
+                            unrealized_pnl = (close - self.entry_price) / self.pip_value * self.position_size
+                        else:  # Short
+                            unrealized_pnl = (self.entry_price - close) / self.pip_value * self.position_size
+                        
+                        profit_threshold = self.early_exit_profit_atr * atr
+                        if unrealized_pnl > profit_threshold:
+                            allow_early_exit = True
+                    
+                    if not allow_early_exit:
+                        # BLOCK: Force agent to keep current position
+                        direction = 1 if self.position == 1 else 2  # Keep Long/Short
+                        action[0] = direction
 
         # Handle agent's action
         if direction == 0:  # Flat/Exit
@@ -420,7 +464,11 @@ def run_backtest(
     min_action_confidence: float = 0.0,
     spread_pips: float = 1.5,
     # v18: Minimum Hold Time
-    min_hold_bars: int = 12
+    min_hold_bars: int = 12,
+    # v19: Profit-based early exit override
+    early_exit_profit_atr: float = 3.0,
+    # v20: Break-even stop loss
+    break_even_atr: float = 2.0
 ) -> BacktestResult:
     """
     Run a full backtest with the trained agent.
@@ -443,6 +491,8 @@ def run_backtest(
         min_action_confidence: Minimum confidence threshold for trades (0.0=disabled)
         spread_pips: Spread cost per trade in pips
         min_hold_bars: Minimum bars to hold before agent can manually exit/flip
+        early_exit_profit_atr: Allow early exit if profit exceeds this ATR multiple
+        break_even_atr: Move SL to break-even when profit reaches this ATR multiple
 
     Returns:
         BacktestResult with all metrics and trades
@@ -468,7 +518,9 @@ def run_backtest(
         use_stop_loss=use_stop_loss,
         use_take_profit=use_take_profit,
         risk_per_trade=float(getattr(env, "risk_per_trade", 100.0)),  # Dollar-based sizing
-        min_hold_bars=min_hold_bars  # v18: Pass min_hold_bars
+        min_hold_bars=min_hold_bars,  # v18: Pass min_hold_bars
+        early_exit_profit_atr=early_exit_profit_atr,  # v19: Profit-based early exit
+        break_even_atr=break_even_atr  # v20: Break-even stop loss
     )
     backtester.reset()
 
