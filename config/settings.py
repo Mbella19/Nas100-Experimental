@@ -272,7 +272,7 @@ class AgentConfig:
     gamma: float = 0.999
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.01        # HIGH entropy to force exploration (was 0.01)
+    ent_coef: float = 0.05        # Increased to prevent catastrophic forgetting (was 0.01)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 

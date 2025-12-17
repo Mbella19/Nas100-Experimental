@@ -28,6 +28,28 @@ from stable_baselines3.common.monitor import Monitor
 import gymnasium as gym
 
 
+def linear_schedule(initial_value: float, final_value: float = None) -> Callable[[float], float]:
+    """
+    Linear learning rate schedule for PPO.
+    
+    Args:
+        initial_value: Starting learning rate
+        final_value: Ending learning rate (default: 5% of initial)
+    
+    Returns:
+        A function that takes progress (1.0 -> 0.0) and returns current LR
+    """
+    if final_value is None:
+        final_value = initial_value * 0.05  # Decay to 5% by default
+    
+    def schedule(progress_remaining: float) -> float:
+        """
+        progress_remaining goes from 1.0 (start) to 0.0 (end)
+        """
+        return final_value + progress_remaining * (initial_value - final_value)
+    
+    return schedule
+
 class MemoryCleanupCallback(BaseCallback):
     """
     Callback to periodically clean up memory during training.
@@ -118,7 +140,8 @@ class SniperAgent:
         net_arch: Optional[list] = None,
         device: Optional[str | torch.device] = None,
         verbose: int = 1,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        use_lr_schedule: bool = True  # NEW: Enable linear LR decay
     ):
         """
         Initialize the Sniper Agent.
@@ -163,11 +186,16 @@ class SniperAgent:
                 device = "cpu"
 
         # Create PPO model
+        # Apply learning rate schedule if enabled
+        lr_value = linear_schedule(learning_rate) if use_lr_schedule else learning_rate
+        if use_lr_schedule and verbose > 0:
+            print(f"Using linear LR schedule: {learning_rate:.2e} -> {learning_rate * 0.05:.2e}")
+        
         try:
             self.model = PPO(
                 policy="MlpPolicy",
                 env=env,
-                learning_rate=learning_rate,
+                learning_rate=lr_value,
                 n_steps=n_steps,
                 batch_size=batch_size,
                 n_epochs=n_epochs,
