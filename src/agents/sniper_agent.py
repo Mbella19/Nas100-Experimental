@@ -53,40 +53,58 @@ def linear_schedule(initial_value: float, final_value: float = None) -> Callable
 
 class EntropyScheduleCallback(BaseCallback):
     """
-    Callback to decay entropy coefficient over training.
+    Callback with stepped entropy phases for training.
     
-    Starts with high entropy (exploration) and decays to low entropy (exploitation).
-    This helps the agent explore early and converge late in training.
+    Phase 1 (0-20M):    ent_coef = 0.05  (explore)
+    Phase 2 (20M-40M):  ent_coef = 0.025 (transition)
+    Phase 3 (40M+):     ent_coef = 0.001 (exploit)
     """
     
     def __init__(
         self, 
-        initial_ent_coef: float = 0.05,
-        final_ent_coef: float = 0.001,
-        total_timesteps: int = 100_000_000,
+        phase1_steps: int = 20_000_000,   # First 20M: explore
+        phase2_steps: int = 20_000_000,   # Next 20M: transition
+        phase1_ent: float = 0.05,         # Explore entropy
+        phase2_ent: float = 0.025,        # Transition entropy
+        phase3_ent: float = 0.001,        # Exploit entropy
         verbose: int = 0
     ):
         super().__init__(verbose)
-        self.initial_ent_coef = initial_ent_coef
-        self.final_ent_coef = final_ent_coef
-        self.total_timesteps = total_timesteps
+        self.phase1_steps = phase1_steps
+        self.phase2_steps = phase2_steps
+        self.phase1_ent = phase1_ent
+        self.phase2_ent = phase2_ent
+        self.phase3_ent = phase3_ent
+        self.current_phase = 1
     
     def _on_step(self) -> bool:
-        # Calculate progress (0.0 at start, 1.0 at end)
-        progress = self.num_timesteps / self.total_timesteps
-        progress = min(progress, 1.0)  # Cap at 1.0
+        steps = self.num_timesteps
         
-        # Linear decay from initial to final
-        current_ent_coef = self.initial_ent_coef + progress * (self.final_ent_coef - self.initial_ent_coef)
+        # Determine current phase and entropy
+        if steps < self.phase1_steps:
+            # Phase 1: Explore
+            current_ent_coef = self.phase1_ent
+            new_phase = 1
+        elif steps < self.phase1_steps + self.phase2_steps:
+            # Phase 2: Transition
+            current_ent_coef = self.phase2_ent
+            new_phase = 2
+        else:
+            # Phase 3: Exploit
+            current_ent_coef = self.phase3_ent
+            new_phase = 3
         
         # Update the model's entropy coefficient
         self.model.ent_coef = current_ent_coef
         
-        # Log occasionally
-        if self.verbose > 0 and self.n_calls % 100_000 == 0:
-            print(f"[EntropySchedule] Step {self.num_timesteps:,}: ent_coef = {current_ent_coef:.6f}")
+        # Log phase transitions
+        if new_phase != self.current_phase:
+            phase_names = {1: "EXPLORE", 2: "TRANSITION", 3: "EXPLOIT"}
+            print(f"\n[EntropySchedule] Phase {new_phase} ({phase_names[new_phase]}): ent_coef = {current_ent_coef}\n")
+            self.current_phase = new_phase
         
         return True
+
 
 class MemoryCleanupCallback(BaseCallback):
     """
@@ -326,11 +344,16 @@ class SniperAgent:
         callback_list = [
             MemoryCleanupCallback(cleanup_freq=5000, verbose=self.verbose),
             TrainingMetricsCallback(log_freq=2000, verbose=self.verbose),
-            # Entropy Schedule: Decay from 0.05 (exploration) to 0.001 (exploitation)
+            # Entropy Schedule: Stepped phases
+            # Phase 1 (0-20M): explore @ 0.05
+            # Phase 2 (20M-40M): transition @ 0.025  
+            # Phase 3 (40M+): exploit @ 0.001
             EntropyScheduleCallback(
-                initial_ent_coef=0.05,
-                final_ent_coef=0.001,
-                total_timesteps=total_timesteps,
+                phase1_steps=20_000_000,
+                phase2_steps=20_000_000,
+                phase1_ent=0.05,
+                phase2_ent=0.025,
+                phase3_ent=0.001,
                 verbose=self.verbose
             )
         ]
