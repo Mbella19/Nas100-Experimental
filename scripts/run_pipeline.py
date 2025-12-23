@@ -481,8 +481,15 @@ def step_6_backtest(
     # Feature dims for Analyst (TCN uses true timeframe keys)
     feature_dims = {'5m': len(feature_cols), '15m': len(feature_cols), '45m': len(feature_cols)}
 
-    # We load analyst frozen
-    analyst = load_analyst(str(analyst_path), feature_dims, device, freeze=True)
+    # Check if analyst should be used (toggle from config)
+    use_analyst = getattr(config.trading, 'use_analyst', True)
+
+    if use_analyst:
+        # We load analyst frozen
+        analyst = load_analyst(str(analyst_path), feature_dims, device, freeze=True)
+    else:
+        logger.info("Analyst DISABLED (use_analyst=False) - using raw market features only")
+        analyst = None
 
     # Prepare test data (last 15%)
     # Use updated lookback keys
@@ -557,6 +564,7 @@ def step_6_backtest(
         returns=test_returns,
         ohlc_data=test_ohlc,
         timestamps=test_timestamps,
+        use_analyst=use_analyst,
     )
 
     # Load agent
@@ -576,6 +584,8 @@ def step_6_backtest(
         use_stop_loss=config.trading.use_stop_loss,
         use_take_profit=config.trading.use_take_profit,
         min_hold_bars=config.trading.min_hold_bars,  # v18: Pass min_hold_bars
+        early_exit_profit_atr=config.trading.early_exit_profit_atr,  # v23.1: Explicit pass for parity
+        break_even_atr=config.trading.break_even_atr,  # v23.1: Explicit pass for parity
     )
 
     # Compare with buy-and-hold

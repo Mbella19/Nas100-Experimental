@@ -86,7 +86,7 @@ Always enforce these rules:
 
 1. **Price Action Patterns**: Pinbar (wick > 2× body), Engulfing, Doji (body < 10% range)
 2. **Market Structure**: Fractal S/R levels, ATR-normalized distance to S/R
-3. **Trend Filters**: SMA(200) distance/ATR, EMA crossovers
+3. **Trend Filters**: SMA(50) distance/ATR, EMA crossovers
 4. **Regime Detection**: Choppiness Index (>61.8 = ranging, <38.2 = trending), ADX (>25 = trending)
 
 ## Key Implementation Details

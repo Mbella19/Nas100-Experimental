@@ -73,7 +73,7 @@ class TradingEnv(gym.Env):
         pip_value: float = 1.0,       # NAS100: 1 point = 1.0 price movement
         lot_size: float = 1.0,        # NAS100 CFD lot size
         point_multiplier: float = 1.0, # Dollar per point per lot
-        spread_pips: float = 3.0,     # NAS100 typical spread
+        spread_pips: float = 3.5,     # NAS100 spread with buffer
         slippage_pips: float = 0.0,   # NAS100 slippage
         fomo_penalty: float = 0.0,   # v15: Meaningful penalty for missing moves (was 0.0)
         chop_penalty: float = 0.0,    # Disabled for stability
@@ -118,6 +118,8 @@ class TradingEnv(gym.Env):
         # Full Eyes Features
         returns: Optional[np.ndarray] = None, # Recent 5m log-returns
         agent_lookback_window: int = 0, # How many return bars to see
+        # Toggle Analyst usage (if False, agent uses only raw market features)
+        use_analyst: bool = True,
     ):
         """
         Initialize the trading environment.
@@ -259,15 +261,30 @@ class TradingEnv(gym.Env):
         # Store num_classes for observation construction
         self.num_classes = num_classes
 
+        # Store use_analyst flag
+        self.use_analyst = use_analyst
+
         # Observation space
         # Context vector + position state (3) + market features (5) + analyst_metrics
         # Binary (2 classes): [p_down, p_up, edge, confidence, uncertainty] = 5
         # Multi-class (3 classes): [p_down, p_neutral, p_up, edge, confidence, uncertainty] = 6
         n_market_features = market_features.shape[1] if len(market_features.shape) > 1 else 5
-        analyst_metrics_dim = 5 if num_classes == 2 else 6
+
+        # Adjust observation dimensions based on use_analyst flag
+        if self.use_analyst and analyst_model is not None:
+            effective_context_dim = context_dim
+            analyst_metrics_dim = 5 if num_classes == 2 else 6
+        else:
+            effective_context_dim = 0
+            analyst_metrics_dim = 0
+            print("Analyst DISABLED - agent using raw market features only")
 
         # Obs Dim = Context + Position(3) + Market + Analyst + SL/TP(2) + Returns
-        obs_dim = context_dim + 3 + n_market_features + analyst_metrics_dim + 2 + self.agent_lookback_window
+        obs_dim = effective_context_dim + 3 + n_market_features + analyst_metrics_dim + 2 + self.agent_lookback_window
+
+        # Store effective dimensions for _get_observation
+        self.effective_context_dim = effective_context_dim
+        self.analyst_metrics_dim = analyst_metrics_dim
 
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -308,6 +325,8 @@ class TradingEnv(gym.Env):
         self._holding_bonus_paid = 0.0
         self._holding_bonus_level = 0
         self.break_even_activated = False  # v20: Reset break-even flag
+        # v21: High-water mark for progressive rewards (reset on every new trade)
+        self._profit_high_water_mark = 0.0
 
         # Precompute context vectors if analyst is provided
         self._precomputed_contexts = None
@@ -315,11 +334,11 @@ class TradingEnv(gym.Env):
         
         # Use pre-computed cache if provided (for sequential context)
         self._precomputed_activations = {}
-        if precomputed_analyst_cache is not None:
+        if self.use_analyst and precomputed_analyst_cache is not None:
             print("Using pre-computed Analyst cache (sequential context)")
             self._precomputed_contexts = precomputed_analyst_cache['contexts'].astype(np.float32)
             self._precomputed_probs = precomputed_analyst_cache['probs'].astype(np.float32)
-            
+
             # Load activations if available
             if 'activations_15m' in precomputed_analyst_cache and precomputed_analyst_cache['activations_15m'] is not None:
                 self._precomputed_activations['15m'] = precomputed_analyst_cache['activations_15m'].astype(np.float32)
@@ -327,10 +346,11 @@ class TradingEnv(gym.Env):
                 self._precomputed_activations['1h'] = precomputed_analyst_cache['activations_1h'].astype(np.float32)
             if 'activations_4h' in precomputed_analyst_cache and precomputed_analyst_cache['activations_4h'] is not None:
                 self._precomputed_activations['4h'] = precomputed_analyst_cache['activations_4h'].astype(np.float32)
-                
+
             print(f"Loaded {len(self._precomputed_contexts)} cached context vectors")
-        elif self.analyst is not None:
+        elif self.use_analyst and self.analyst is not None:
             self._precompute_contexts()
+        # else: use_analyst=False - skip all analyst precomputation
 
     def _precompute_contexts(self):
         """Precompute all context vectors for efficiency."""
@@ -493,30 +513,37 @@ class TradingEnv(gym.Env):
 
     def _get_observation(self) -> np.ndarray:
         """Construct observation vector."""
-        # Context vector and probabilities
-        # Get Analyst context
-        context, probs, weights, activations = self._get_analyst_data(self.current_idx)
-        self.current_probs = probs  # Store for action enforcement
-        self.current_activations = activations # Store for info
+        # Context vector and probabilities (only when analyst is enabled)
+        if self.use_analyst:
+            context, probs, weights, activations = self._get_analyst_data(self.current_idx)
+            self.current_probs = probs  # Store for action enforcement
+            self.current_activations = activations  # Store for info
 
-        # Calculate Analyst metrics for observation
-        # [p_down, p_up, confidence, edge]
-        if len(probs) == 2 or self.num_classes == 2:
-            p_down = probs[0]
-            p_up = probs[1] if len(probs) > 1 else 1 - p_down
-            confidence = max(p_down, p_up)
-            edge = p_up - p_down
-            uncertainty = 1.0 - confidence
-            analyst_metrics = np.array([p_down, p_up, edge, confidence, uncertainty], dtype=np.float32)
+            # Calculate Analyst metrics for observation
+            # [p_down, p_up, confidence, edge]
+            if len(probs) == 2 or self.num_classes == 2:
+                p_down = probs[0]
+                p_up = probs[1] if len(probs) > 1 else 1 - p_down
+                confidence = max(p_down, p_up)
+                edge = p_up - p_down
+                uncertainty = 1.0 - confidence
+                analyst_metrics = np.array([p_down, p_up, edge, confidence, uncertainty], dtype=np.float32)
+            else:
+                # Multi-class: [p_down, p_neutral, p_up]
+                p_down = probs[0]
+                p_neutral = probs[1]
+                p_up = probs[2]
+                confidence = np.max(probs)  # Use np.max for multi-class confidence
+                edge = p_up - p_down
+                uncertainty = 1.0 - confidence
+                analyst_metrics = np.array([p_down, p_neutral, p_up, edge, confidence, uncertainty], dtype=np.float32)
         else:
-            # Multi-class: [p_down, p_neutral, p_up]
-            p_down = probs[0]
-            p_neutral = probs[1]
-            p_up = probs[2]
-            confidence = np.max(probs) # Use np.max for multi-class confidence
-            edge = p_up - p_down
-            uncertainty = 1.0 - confidence
-            analyst_metrics = np.array([p_down, p_neutral, p_up, edge, confidence, uncertainty], dtype=np.float32)
+            # No analyst mode - empty context and metrics
+            context = np.array([], dtype=np.float32)
+            analyst_metrics = np.array([], dtype=np.float32)
+            # Set dummy probs for compatibility (action enforcement disabled anyway)
+            self.current_probs = np.array([0.5, 0.5], dtype=np.float32)
+            self.current_activations = None
 
         # Position state
         current_price = self.close_prices[self.current_idx]
@@ -529,13 +556,13 @@ class TradingEnv(gym.Env):
             # FIX: entry_price_norm should be POSITIVE when position is profitable
             # Previously was inverted for Long positions (winning Long = negative value)
             if self.position == 1:  # Long: positive when price goes UP (winning)
-                entry_price_norm = (current_price - self.entry_price) / (atr_safe * 100)
+                entry_price_norm = (current_price - self.entry_price) / atr_safe
             else:  # Short: positive when price goes DOWN (winning)
-                entry_price_norm = (self.entry_price - current_price) / (atr_safe * 100)
+                entry_price_norm = (self.entry_price - current_price) / atr_safe
             # Clip to prevent extreme values
             entry_price_norm = np.clip(entry_price_norm, -10.0, 10.0)
             unrealized_pnl = self._calculate_unrealized_pnl()
-            unrealized_pnl_norm = unrealized_pnl / 100  # Normalize by 100 pips
+            unrealized_pnl_norm = unrealized_pnl / atr_safe  # Normalize by ATR (consistent with entry_price_norm)
         else:
             entry_price_norm = 0.0
             unrealized_pnl_norm = 0.0
@@ -935,11 +962,13 @@ class TradingEnv(gym.Env):
             # Clip to reasonable limits to prevent extreme leverage
             new_size = np.clip(new_size, 0.1, 50.0)  # Max 50 lots
 
+        pnl_delta = 0.0
         reward = 0.0
         info = {
             'trade_opened': False,
             'trade_closed': False,
-            'pnl': 0.0
+            'pnl': 0.0,
+            'executed_direction': direction  # v23.1: Track actual direction after analyst masking for backtest parity
         }
 
         current_price = self.close_prices[self.current_idx]
@@ -1010,6 +1039,7 @@ class TradingEnv(gym.Env):
                 # This captures the last price leg that would otherwise be missed
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
+                pnl_delta += final_delta
                 reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus was causing reward-PnL divergence
@@ -1038,12 +1068,14 @@ class TradingEnv(gym.Env):
                 self.prev_unrealized_pnl = 0.0
                 self._holding_bonus_paid = 0.0
                 self._holding_bonus_level = 0
+                self._profit_high_water_mark = 0.0  # v21: Reset high-water mark
 
         elif direction == 1:  # Long
             if self.position == -1:  # Close short first
                 # CRITICAL: Calculate final delta BEFORE resetting position
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
+                pnl_delta += final_delta
                 reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus (see comment in Flat/Exit case above)
@@ -1067,6 +1099,7 @@ class TradingEnv(gym.Env):
                 self.prev_unrealized_pnl = 0.0
                 self._holding_bonus_paid = 0.0
                 self._holding_bonus_level = 0
+                self._profit_high_water_mark = 0.0  # v21: Reset high-water mark
 
             if self.position != 1:  # Open long
                 self.position = 1
@@ -1094,6 +1127,7 @@ class TradingEnv(gym.Env):
                 # CRITICAL: Calculate final delta BEFORE resetting position
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
+                pnl_delta += final_delta
                 reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus (see comment in Flat/Exit case above)
@@ -1117,6 +1151,7 @@ class TradingEnv(gym.Env):
                 self.prev_unrealized_pnl = 0.0
                 self._holding_bonus_paid = 0.0
                 self._holding_bonus_level = 0
+                self._profit_high_water_mark = 0.0  # v21: Reset high-water mark
 
             if self.position != -1:  # Open short
                 self.position = -1
@@ -1139,81 +1174,31 @@ class TradingEnv(gym.Env):
                 reward += self.trade_entry_bonus
                 info['trade_entry_bonus'] = self.trade_entry_bonus
 
-        # Continuous PnL feedback: reward based on CHANGE in unrealized PnL each step.
-        # v16: DISABLED by default (use_sparse_rewards=True) because it causes scalping!
-        # v17: LOSS TOLERANCE MODE - Allow normal retracements, only cut deep losers
-        #      - Profitable trades: get per-bar reward (let winners run)
-        #      - Small drawdown (< loss_tolerance_atr): still get per-bar reward (hold through noise)
-        #      - Deep loss (> loss_tolerance_atr): NO per-bar feedback (encourage exit)
+        # SIMPLIFIED CONTINUOUS PNL REWARD (v23)
+        # Pure mark-to-market PnL delta - the agent receives reward proportional to
+        # the actual change in unrealized PnL each step. This is the correct signal
+        # for learning trading behavior:
+        #   - Price moves in favor → positive reward
+        #   - Price moves against → negative reward
+        #   - Agent learns "price up = good for long, price down = bad for long"
         #
-        # NOTE: This block only runs for OPEN positions. On exit, the final_delta is
-        # captured above BEFORE resetting position, and prev_unrealized_pnl is reset to 0.
-        # Then this block sees position=0 and skips, preventing double-counting.
+        # CRITICAL FIX: Previous versions calculated pnl_delta but never added it
+        # to reward! Only high-water mark crossings added reward, which created
+        # asymmetric incentives and prevented learning.
         if self.position != 0:
             current_unrealized_pnl = self._calculate_unrealized_pnl()
             pnl_delta = current_unrealized_pnl - self.prev_unrealized_pnl
-            
-            # Get current ATR for loss tolerance calculation
-            if len(self.market_features.shape) > 1:
-                current_atr = self.market_features[self.current_idx, 0]
-            else:
-                current_atr = 10.0  # Default ATR ~10 points for NAS100
-            
-            # Calculate loss tolerance in points (negative threshold)
-            loss_tolerance_points = -(current_atr * self.loss_tolerance_atr * self.position_size)
-            
-            # v17: Give continuous rewards when trade is:
-            # - Profitable (current_unrealized_pnl > 0), OR
-            # - Within acceptable drawdown (current_unrealized_pnl > loss_tolerance_points)
-            if not self.use_sparse_rewards:
-                # Original mode: reward all PnL changes
-                reward += pnl_delta * self.reward_scaling
-            elif current_unrealized_pnl > loss_tolerance_points:
-                # Sparse mode with loss tolerance: reward when profitable OR in acceptable drawdown
-                reward += pnl_delta * self.reward_scaling
-            # Else: deep loss beyond tolerance, no per-bar reward (encourage exit)
 
-            # Holding bonus (gated + progress-based + capped):
-            # Pay only when the trade achieves a NEW profit milestone beyond break-even.
-            # This rewards "let winners run" without incentivizing time-based farming.
-            # NOTE: Holding bonus is ALWAYS active (even in sparse mode) to encourage holds
-            if current_unrealized_pnl > 0:
-                entry_cost_points = (self.spread_pips + self.slippage_pips) * self.position_size
-                buffer_points = entry_cost_points * float(self.HOLDING_BONUS_BUFFER_FRACTION_OF_ENTRY_COST)
-                net_unrealized_pnl = current_unrealized_pnl - entry_cost_points
+            # CORE FIX: Actually add the PnL delta to reward!
+            reward += pnl_delta * self.reward_scaling
 
-                # Gate on being net profitable beyond costs + buffer.
-                if net_unrealized_pnl > buffer_points:
-                    milestone_points = float(self.HOLDING_BONUS_MILESTONE_PIPS) * self.position_size
-                    if milestone_points > 1e-8:
-                        # Level 0: not eligible
-                        # Level 1: just crossed buffer
-                        # Level k: crossed buffer + (k-1)*milestone_points
-                        level = int(np.floor((net_unrealized_pnl - buffer_points) / milestone_points)) + 1
-                        if level > self._holding_bonus_level:
-                            levels_gained = level - self._holding_bonus_level
-                            desired_bonus = levels_gained * float(self.HOLDING_BONUS_AMOUNT)
-
-                            entry_cost_reward = entry_cost_points * self.reward_scaling
-                            cap_reward = entry_cost_reward * float(self.HOLDING_BONUS_CAP_FRACTION_OF_ENTRY_COST)
-                            remaining = cap_reward - self._holding_bonus_paid
-
-                            if remaining > 0:
-                                paid_bonus = min(desired_bonus, remaining)
-                                reward += paid_bonus
-                                self._holding_bonus_paid += paid_bonus
-
-                            # Always update level once the milestone is reached to avoid re-paying
-                            # if the trade retraces and later re-crosses the same milestone.
-                            self._holding_bonus_level = level
             info['unrealized_pnl'] = current_unrealized_pnl
             info['pnl_delta'] = pnl_delta
+            info['reward_type'] = 'continuous_pnl'
             self.prev_unrealized_pnl = current_unrealized_pnl
         else:
             # Position is flat - ensure tracking is reset
             self.prev_unrealized_pnl = 0.0
-            self._holding_bonus_paid = 0.0
-            self._holding_bonus_level = 0
 
         # FOMO penalty: flat during high momentum move
         if self.position == 0:
@@ -1288,8 +1273,16 @@ class TradingEnv(gym.Env):
         # This enforces risk management regardless of what the agent wants to do
         sl_tp_reward, sl_tp_info = self._check_stop_loss_take_profit()
 
-        # THEN: Execute agent's action (which may open new positions or do nothing)
-        action_reward, action_info = self._execute_action(action)
+        # v23.1 FIX: If SL/TP triggered (trade closed), skip agent action this step
+        # This prevents the "immediate re-entry" bug where agent can re-open a position
+        # in the same step that SL/TP closed it, effectively bypassing risk management.
+        # The agent must wait until the NEXT step to make a new decision.
+        if sl_tp_info.get('trade_closed'):
+            action_reward = 0.0
+            action_info = {'action_skipped_sl_tp': True, 'intended_action': action.tolist()}
+        else:
+            # THEN: Execute agent's action (which may open new positions or do nothing)
+            action_reward, action_info = self._execute_action(action)
 
         # Combine rewards and info
         reward = sl_tp_reward + action_reward
@@ -1517,7 +1510,7 @@ def create_env_from_dataframes(
 
     # Extract config values (defaults for NAS100)
     pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
-    spread_pips = 2.5  # NAS100 typical spread (was 0.2 for EURUSD)
+    spread_pips = 3.5  # NAS100 spread with buffer
     fomo_penalty = -0.05  # Reduced from -0.5 (was dominating PnL rewards)
     chop_penalty = -0.01  # Reduced from -0.1
     fomo_threshold_atr = 2.0  # Only trigger on significant moves

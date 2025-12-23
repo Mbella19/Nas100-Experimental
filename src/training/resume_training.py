@@ -224,8 +224,8 @@ def resume_training():
             config=config,
             device=device
         )
-        # OVERRIDE SPREAD
-        env.spread_pips = 1.0
+        # Match spread to config for consistent training
+        env.spread_pips = 3.5
         return env
 
     # Use 8 vectorized environments for M2 (Batch processing on GPU)

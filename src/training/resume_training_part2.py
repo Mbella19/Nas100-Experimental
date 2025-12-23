@@ -177,7 +177,7 @@ def resume_training_part2():
             config=config,
             device=device
         )
-        env.spread_pips = 1.0
+        env.spread_pips = 3.5  # Match config for consistent training
         return env
 
     # REDUCED TO 4 ENVS TO PREVENT OOM

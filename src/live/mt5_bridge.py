@@ -30,6 +30,7 @@ import torch
 
 from config.settings import Config, get_device
 from src.agents.sniper_agent import SniperAgent
+from src.agents.recurrent_agent import RecurrentSniperAgent
 from src.data.features import engineer_all_features
 from src.data.normalizer import FeatureNormalizer
 from src.data.resampler import resample_all_timeframes, align_timeframes
@@ -79,7 +80,7 @@ class BridgeConfig:
     max_m1_rows: int = 60 * 24 * 30  # ~30 days
 
     # Minimum M1 rows required before trading is enabled.
-    # This is primarily driven by 45m SMA(200): 200 * 45 = 9000 minutes.
+    # Conservative: sized to cover long-window features (e.g., 45m SMA(50)).
     min_m1_rows: int = 10_000
 
     # Execution mapping (EA expects lots).
@@ -348,8 +349,27 @@ class MT5BridgeState:
 
         obs_dim = self._expected_obs_dim()
         dummy_env = _make_dummy_env(obs_dim)
-        agent_path = system_cfg.paths.models_agent / "final_model.zip"
-        self.agent = SniperAgent.load(str(agent_path), dummy_env, device="cpu")
+
+        # Detect if this is a recurrent model by checking for marker file
+        # Check both standard and recurrent directories
+        recurrent_marker = system_cfg.paths.models_agent_recurrent / ".recurrent"
+        recurrent_model_path = system_cfg.paths.models_agent_recurrent / "final_model.zip"
+        standard_model_path = system_cfg.paths.models_agent / "final_model.zip"
+
+        self.is_recurrent = False
+        if recurrent_marker.exists() and recurrent_model_path.exists():
+            # Load recurrent model
+            self.is_recurrent = True
+            self.agent = RecurrentSniperAgent.load(str(recurrent_model_path), dummy_env, device="cpu")
+            self.agent.reset_lstm_states()
+            logger.info("Loaded RecurrentPPO agent from %s", recurrent_model_path)
+        else:
+            # Load standard PPO model
+            self.agent = SniperAgent.load(str(standard_model_path), dummy_env, device="cpu")
+            logger.info("Loaded standard PPO agent from %s", standard_model_path)
+
+        # Track position changes for LSTM episode boundary detection
+        self._last_position: int = 0
 
         self.last_decision_label_utc: Optional[pd.Timestamp] = None
         # v18 parity: track entry bar for min-hold enforcement (fallback when MT5 omits open_time).
@@ -586,11 +606,26 @@ class MT5BridgeState:
             self.last_decision_label_utc = label
             return {"action": 999, "reason": "dry_run", **obs_info}
 
-        action, _ = self.agent.predict(
-            obs,
-            deterministic=True,
-            min_action_confidence=float(self.system_cfg.trading.min_action_confidence),
-        )
+        # Detect episode boundary for LSTM state management
+        # Episode boundary = position changed from open to flat
+        episode_start = (self._last_position != 0 and position == 0)
+        self._last_position = position
+
+        if self.is_recurrent:
+            # RecurrentPPO needs episode_start flag for LSTM state management
+            action, _ = self.agent.predict(
+                obs,
+                deterministic=True,
+                episode_start=episode_start,
+                min_action_confidence=float(self.system_cfg.trading.min_action_confidence),
+            )
+        else:
+            # Standard PPO
+            action, _ = self.agent.predict(
+                obs,
+                deterministic=True,
+                min_action_confidence=float(self.system_cfg.trading.min_action_confidence),
+            )
         action = np.array(action).astype(np.int32).flatten()
         if action.size < 2:
             return {"action": 999, "reason": "invalid_agent_action"}

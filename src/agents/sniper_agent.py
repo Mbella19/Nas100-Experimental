@@ -53,56 +53,67 @@ def linear_schedule(initial_value: float, final_value: float = None) -> Callable
 
 class EntropyScheduleCallback(BaseCallback):
     """
-    Callback with stepped entropy phases for training.
-    
-    Phase 1 (0-20M):    ent_coef = 0.05  (explore)
-    Phase 2 (20M-40M):  ent_coef = 0.025 (transition)
-    Phase 3 (40M+):     ent_coef = 0.001 (exploit)
+    Callback with 4-phase stepped entropy for 1B timestep training.
+
+    v24: Extended to 4 phases for 1B training run.
+
+    Phase 1 (0-200M):     ent_coef = 0.10  (extra high explore)
+    Phase 2 (200M-500M):  ent_coef = 0.05  (explore)
+    Phase 3 (500M-800M):  ent_coef = 0.02  (transition)
+    Phase 4 (800M-1B):    ent_coef = 0.01  (exploit - never below 0.01!)
     """
-    
+
     def __init__(
-        self, 
-        phase1_steps: int = 20_000_000,   # First 20M: explore
-        phase2_steps: int = 20_000_000,   # Next 20M: transition
-        phase1_ent: float = 0.05,         # Explore entropy
-        phase2_ent: float = 0.025,        # Transition entropy
-        phase3_ent: float = 0.001,        # Exploit entropy
+        self,
+        phase1_steps: int = 200_000_000,  # First 200M: extra high explore
+        phase2_steps: int = 300_000_000,  # Next 300M (200M-500M): explore
+        phase3_steps: int = 300_000_000,  # Next 300M (500M-800M): transition
+        phase1_ent: float = 0.10,         # Extra high exploration
+        phase2_ent: float = 0.05,         # Explore entropy
+        phase3_ent: float = 0.02,         # Transition entropy
+        phase4_ent: float = 0.01,         # Exploit entropy (never below 0.01!)
         verbose: int = 0
     ):
         super().__init__(verbose)
         self.phase1_steps = phase1_steps
         self.phase2_steps = phase2_steps
+        self.phase3_steps = phase3_steps
         self.phase1_ent = phase1_ent
         self.phase2_ent = phase2_ent
         self.phase3_ent = phase3_ent
+        self.phase4_ent = phase4_ent
         self.current_phase = 1
-    
+
     def _on_step(self) -> bool:
         steps = self.num_timesteps
-        
+
         # Determine current phase and entropy
         if steps < self.phase1_steps:
-            # Phase 1: Explore
+            # Phase 1: Extra High Explore (0-200M)
             current_ent_coef = self.phase1_ent
             new_phase = 1
         elif steps < self.phase1_steps + self.phase2_steps:
-            # Phase 2: Transition
+            # Phase 2: Explore (200M-500M)
             current_ent_coef = self.phase2_ent
             new_phase = 2
-        else:
-            # Phase 3: Exploit
+        elif steps < self.phase1_steps + self.phase2_steps + self.phase3_steps:
+            # Phase 3: Transition (500M-800M)
             current_ent_coef = self.phase3_ent
             new_phase = 3
-        
+        else:
+            # Phase 4: Exploit (800M-1B)
+            current_ent_coef = self.phase4_ent
+            new_phase = 4
+
         # Update the model's entropy coefficient
         self.model.ent_coef = current_ent_coef
-        
+
         # Log phase transitions
         if new_phase != self.current_phase:
-            phase_names = {1: "EXPLORE", 2: "TRANSITION", 3: "EXPLOIT"}
+            phase_names = {1: "EXTRA EXPLORE", 2: "EXPLORE", 3: "TRANSITION", 4: "EXPLOIT"}
             print(f"\n[EntropySchedule] Phase {new_phase} ({phase_names[new_phase]}): ent_coef = {current_ent_coef}\n")
             self.current_phase = new_phase
-        
+
         return True
 
 
@@ -186,7 +197,7 @@ class SniperAgent:
         learning_rate: float = 3e-4,
         n_steps: int = 2048,
         batch_size: int = 256,        # Increased from 64 for stability
-        n_epochs: int = 20,           # Increased from 10
+        n_epochs: int = 4,            # Match config/settings.py (was 20, caused overfitting)
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_range: float = 0.2,
@@ -277,7 +288,7 @@ class SniperAgent:
                 self.model = PPO(
                     policy="MlpPolicy",
                     env=env,
-                    learning_rate=learning_rate,
+                    learning_rate=lr_value,  # Use scheduled LR, not raw value
                     n_steps=n_steps,
                     batch_size=batch_size,
                     n_epochs=n_epochs,
@@ -344,18 +355,11 @@ class SniperAgent:
         callback_list = [
             MemoryCleanupCallback(cleanup_freq=5000, verbose=self.verbose),
             TrainingMetricsCallback(log_freq=2000, verbose=self.verbose),
-            # Entropy Schedule: Stepped phases
-            # Phase 1 (0-20M): explore @ 0.05
-            # Phase 2 (20M-40M): transition @ 0.025  
-            # Phase 3 (40M+): exploit @ 0.001
-            EntropyScheduleCallback(
-                phase1_steps=20_000_000,
-                phase2_steps=20_000_000,
-                phase1_ent=0.05,
-                phase2_ent=0.025,
-                phase3_ent=0.001,
-                verbose=self.verbose
-            )
+            # Entropy Schedule: Stepped phases (uses class defaults)
+            # Phase 1 (0-50M): explore @ 0.05
+            # Phase 2 (50M-100M): transition @ 0.02
+            # Phase 3 (100M+): exploit @ 0.01 (never below 0.01!)
+            EntropyScheduleCallback(verbose=self.verbose)
         ]
 
         # Add Checkpoint Callback (Save every 100k steps)
@@ -632,3 +636,46 @@ def create_agent(
         net_arch=config.net_arch if hasattr(config, 'net_arch') else None,
         device=device
     )
+
+
+def create_agent_with_config(
+    env: gym.Env,
+    config: Optional[object] = None,
+    device: Optional[str | torch.device] = None
+) -> 'SniperAgent | RecurrentSniperAgent':
+    """
+    Factory function to create either SniperAgent or RecurrentSniperAgent.
+
+    This is the primary factory function for agent creation. It selects between
+    standard PPO (SniperAgent) and RecurrentPPO (RecurrentSniperAgent) based on
+    the config.recurrent_agent.use_recurrent flag.
+
+    Args:
+        env: Trading environment
+        config: Full Config object (with agent and recurrent_agent sub-configs)
+        device: Device for training
+
+    Returns:
+        SniperAgent or RecurrentSniperAgent based on config
+    """
+    if config is None:
+        return SniperAgent(env, device=device)
+
+    # Check if recurrent mode is enabled
+    recurrent_cfg = getattr(config, 'recurrent_agent', None)
+    use_recurrent = recurrent_cfg.use_recurrent if recurrent_cfg else False
+
+    if use_recurrent:
+        # Import here to avoid circular imports and only when needed
+        from .recurrent_agent import create_recurrent_agent
+
+        print("[Agent Factory] Creating RecurrentSniperAgent (LSTM-based) - EXPERIMENTAL")
+        return create_recurrent_agent(
+            env=env,
+            agent_config=config.agent,
+            recurrent_config=config.recurrent_agent,
+            device=device
+        )
+    else:
+        print("[Agent Factory] Creating SniperAgent (standard PPO)")
+        return create_agent(env, config.agent, device=device)

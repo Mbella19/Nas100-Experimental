@@ -53,16 +53,16 @@ class Backtester:
         pip_value: float = 1.0,       # NAS100: 1 point = 1.0 price movement (was 0.0001 for EURUSD)
         lot_size: float = 1.0,        # NAS100 CFD: $1 per point (was 100000 for EURUSD)
         point_multiplier: float = 1.0,  # PnL: points × pip_value × lot_size × multiplier = $1/point
-        # Risk Management
-        sl_atr_multiplier: float = 1.5,
-        tp_atr_multiplier: float = 3.0,
+        # Risk Management (MUST match TradingConfig for 1:1 training parity)
+        sl_atr_multiplier: float = 3.0,   # v23.1: Match config/settings.py TradingConfig (was 2.0)
+        tp_atr_multiplier: float = 6.0,   # v23.1: Match config/settings.py TradingConfig (was 12.0)
         use_stop_loss: bool = True,
         use_take_profit: bool = True,
         # Volatility Sizing (Dollar-based risk)
         volatility_sizing: bool = True,
         risk_per_trade: float = 100.0,   # Dollar risk per trade (e.g., $100 per trade)
         # v18: Minimum Hold Time
-        min_hold_bars: int = 12,  # Must hold for N bars before manual exit/flip allowed
+        min_hold_bars: int = 0,  # v23.1: Match config (was 12) - must hold for N bars before exit
         # v19: Profit-based early exit override
         early_exit_profit_atr: float = 3.0,  # Allow early exit if profit > this ATR multiple
         # v20: Break-even stop loss
@@ -365,7 +365,19 @@ class Backtester:
         sl_tp_pnl, close_reason = self._check_stop_loss_take_profit(high, low, close, time, atr)
         if sl_tp_pnl != 0.0:
             pnl += sl_tp_pnl
-            # Position is now flat after SL/TP, agent can still open new position
+
+        # v23.1 PARITY FIX: If SL/TP triggered (trade closed), skip agent action this step
+        # This matches TradingEnv behavior where agent cannot re-enter same bar
+        # Without this fix, backtest allows immediate re-entry after SL/TP which training blocked
+        if close_reason is not None:
+            # Position was closed by SL/TP - skip agent action (parity with training)
+            self.current_step += 1
+            # Record equity (mark-to-market, but position is now flat)
+            self.equity_history.append(self.balance)
+            # Record action and position
+            self.actions_history.append(action.copy())
+            self.positions_history.append(self.position)
+            return pnl
 
         # v18: MINIMUM HOLD TIME CHECK (parity with TradingEnv)
         # Block manual exits AND position flips before min_hold_bars have passed since entry.
@@ -456,15 +468,15 @@ def run_backtest(
     deterministic: bool = True,
     start_idx: Optional[int] = None,
     max_steps: Optional[int] = None,
-    # Risk Management (defaults from config)
-    sl_atr_multiplier: float = 1.5,
-    tp_atr_multiplier: float = 3.0,
+    # Risk Management (MUST match TradingConfig for 1:1 training parity)
+    sl_atr_multiplier: float = 3.0,    # v23.1: Match config/settings.py TradingConfig (was 2.0)
+    tp_atr_multiplier: float = 6.0,    # v23.1: Match config/settings.py TradingConfig (was 12.0)
     use_stop_loss: bool = True,
     use_take_profit: bool = True,
     min_action_confidence: float = 0.0,
-    spread_pips: float = 1.5,
+    spread_pips: float = 3.5,          # v23.1: Match config/settings.py TradingConfig
     # v18: Minimum Hold Time
-    min_hold_bars: int = 12,
+    min_hold_bars: int = 0,            # v23.1: Match config/settings.py TradingConfig (was 12)
     # v19: Profit-based early exit override
     early_exit_profit_atr: float = 3.0,
     # v20: Break-even stop loss
@@ -505,16 +517,29 @@ def run_backtest(
 
     days_covered = max_steps / 288  # 288 5-min bars per day
     logger.info(f"Backtest coverage: start_idx={start_idx}, max_steps={max_steps} ({days_covered:.1f} days of 5m data)")
-    logger.info(f"Risk Management: SL={sl_atr_multiplier}x ATR (enabled={use_stop_loss}), TP={tp_atr_multiplier}x ATR (enabled={use_take_profit})")
+
+    # Log actual parameters being used (may come from env or defaults)
+    env_sl = getattr(env, 'sl_atr_multiplier', None)
+    env_tp = getattr(env, 'tp_atr_multiplier', None)
+    env_spread = getattr(env, 'spread_pips', None)
+    logger.info(f"Risk Management: SL={sl_atr_multiplier}x ATR (env={env_sl}), TP={tp_atr_multiplier}x ATR (env={env_tp})")
+    logger.info(f"Transaction Cost: spread={spread_pips} pips (env={env_spread})")
+    logger.info(f"Position Management: min_hold={min_hold_bars} bars, early_exit={early_exit_profit_atr}x ATR, break_even={break_even_atr}x ATR")
     
     if min_action_confidence > 0.0:
         logger.info(f"Confidence Threshold: {min_action_confidence:.2f}")
 
+    # Read SL/TP from environment if available (ensures 1:1 parity with training)
+    # Falls back to function defaults if env doesn't have these attributes
+    actual_sl_atr = getattr(env, 'sl_atr_multiplier', sl_atr_multiplier)
+    actual_tp_atr = getattr(env, 'tp_atr_multiplier', tp_atr_multiplier)
+    actual_spread = getattr(env, 'spread_pips', spread_pips)
+
     backtester = Backtester(
         initial_balance=initial_balance,
         pip_value=getattr(env, 'pip_value', 1.0),
-        sl_atr_multiplier=sl_atr_multiplier,
-        tp_atr_multiplier=tp_atr_multiplier,
+        sl_atr_multiplier=actual_sl_atr,
+        tp_atr_multiplier=actual_tp_atr,
         use_stop_loss=use_stop_loss,
         use_take_profit=use_take_profit,
         risk_per_trade=float(getattr(env, "risk_per_trade", 100.0)),  # Dollar-based sizing
@@ -528,11 +553,18 @@ def run_backtest(
     original_max_steps = env.max_steps
     env.max_steps = max_steps
 
+    # Detect if this is a recurrent agent (has LSTM states)
+    is_recurrent = hasattr(agent, 'reset_lstm_states')
+    if is_recurrent:
+        agent.reset_lstm_states()
+        logger.info("Using RecurrentPPO agent - LSTM states initialized")
+
     # Reset with FIXED start_idx to ensure full test coverage (not random!)
     obs, info = env.reset(options={'start_idx': start_idx})
     done = False
     truncated = False
     step = 0
+    episode_start = True  # Track episode start for recurrent agents
     equity_timestamps: List[int] = []
 
     env_timestamps = getattr(env, 'timestamps', None)
@@ -556,11 +588,22 @@ def run_backtest(
 
     while not done and not truncated:
         # Get action from agent
-        action, _ = agent.predict(
-            obs, 
-            deterministic=deterministic,
-            min_action_confidence=min_action_confidence
-        )
+        if is_recurrent:
+            # RecurrentPPO needs episode_start flag for LSTM state management
+            action, _ = agent.predict(
+                obs,
+                deterministic=deterministic,
+                episode_start=episode_start,
+                min_action_confidence=min_action_confidence
+            )
+            episode_start = False  # Only first step is episode start
+        else:
+            # Standard PPO
+            action, _ = agent.predict(
+                obs,
+                deterministic=deterministic,
+                min_action_confidence=min_action_confidence
+            )
 
         # Step environment
         obs, reward, done, truncated, info = env.step(action)
@@ -589,8 +632,15 @@ def run_backtest(
         if hasattr(env, 'market_features') and len(env.market_features.shape) > 1:
             atr = env.market_features[bar_idx, 0]
 
+        # v23.1 PARITY FIX: Use EXECUTED action (after analyst masking), not intended action
+        # TradingEnv may have masked the action due to enforce_analyst_alignment=True
+        # Without this, backtest would take trades that training blocked
+        executed_action = action.copy()
+        if 'executed_direction' in info:
+            executed_action[0] = info['executed_direction']
+
         # Step backtester with high/low/close for accurate SL/TP detection
-        backtester.step(action, high, low, close, time, atr=atr, spread_pips=spread_pips)
+        backtester.step(executed_action, high, low, close, time, atr=atr, spread_pips=actual_spread)
         equity_timestamps.append(ts_sec)
 
         step += 1
@@ -598,12 +648,22 @@ def run_backtest(
         if step % 1000 == 0:
             logger.info(f"Backtest step {step}, Balance: ${backtester.balance:.2f}")
 
-    # Close any remaining position at the end
+    # Close any remaining position at the end.
+    # Parity with TradingEnv episode-end forced close:
+    # TradingEnv closes at `exit_idx = min(current_idx, len(close_prices) - 1)` AFTER incrementing current_idx.
     if backtester.position != 0:
-        final_price = env.close_prices[env.current_idx - 1]
-        final_time = pd.to_datetime(_timestamp_seconds(env.current_idx - 1), unit='s')
+        exit_idx = min(int(env.current_idx), len(env.close_prices) - 1)
+        exit_ts = _timestamp_seconds(exit_idx)
+        final_price = float(env.close_prices[exit_idx])
+        final_time = pd.to_datetime(exit_ts, unit='s')
         backtester._close_position(final_price, final_time)
-        backtester.equity_history[-1] = backtester.balance
+
+        # Ensure the equity curve ends at the same bar/time as the forced close.
+        if equity_timestamps and equity_timestamps[-1] != exit_ts:
+            equity_timestamps.append(exit_ts)
+            backtester.equity_history.append(backtester.balance)
+        else:
+            backtester.equity_history[-1] = backtester.balance
 
     # Restore original max_steps
     env.max_steps = original_max_steps

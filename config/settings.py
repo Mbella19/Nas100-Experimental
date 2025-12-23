@@ -58,10 +58,16 @@ class PathConfig:
     def models_agent(self) -> Path:
         return self.base_dir / "models" / "agent"
 
+    @property
+    def models_agent_recurrent(self) -> Path:
+        """RecurrentPPO model directory for parallel experiments."""
+        return self.base_dir / "models" / "agent_recurrent"
+
     def ensure_dirs(self):
         """Create all necessary directories."""
         for path in [self.data_raw, self.data_processed,
-                     self.models_analyst, self.models_agent]:
+                     self.models_analyst, self.models_agent,
+                     self.models_agent_recurrent]:
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -185,25 +191,31 @@ class InstrumentConfig:
 @dataclass
 class TradingConfig:
     """Trading environment configuration for NAS100."""
-    spread_pips: float = 3.0    # NAS100 spread (training value)
+    # Toggle Market Analyst usage
+    # If False, agent trains with only raw market features (no analyst context/metrics)
+    use_analyst: bool = True  # v23: Re-enabled for directional context
+
+    spread_pips: float = 3.5    # NAS100 spread with buffer for realistic execution
     slippage_pips: float = 0.0  # NAS100 slippage
 
     # Confidence filtering: Only take trades when agent probability >= threshold
-    min_action_confidence: float = 0.60  # Filter low-confidence trades (0.0 = disabled)
+    min_action_confidence: float = 0.0  # Filter low-confidence trades (0.0 = disabled)
 
     # NEW: Enforce Analyst Alignment (Action Masking)
     # If True, Agent can ONLY trade in direction of Analyst (or Flat)
-    # DISABLED: Soft masking breaks PPO gradients - agent samples action X, gets
-    # masked to Flat, but PPO updates as if X led to the reward. This causes
-    # frozen action distributions and no learning.
-    enforce_analyst_alignment: bool = True  # Force agent to trade ONLY in analyst's predicted direction
+    # When enabled, if agent tries to trade against analyst prediction, action is forced to Flat
+    # This constrains the agent to follow the Analyst's directional conviction
+    enforce_analyst_alignment: bool = True  # ENABLED - Agent must align with Analyst direction
     
     # NEW: Risk-Based Sizing (Not Fixed Lots)
     risk_multipliers: Tuple[float, ...] = (1.5, 2.0, 2.5, 3.0)
     
     # NEW: ATR-Based Stops (Not Fixed Pips)
-    sl_atr_multiplier: float = 2.0   # v17: Tightened from 4.0 for better R:R (1:6)
-    tp_atr_multiplier: float = 12.0
+    # v23.5 FIX: Changed from 2.0/12.0 (1:6 inverted R/R) to 3.0/6.0 (1:2 standard R/R)
+    # Training logs showed 54% win rate but negative PnL because losses were 6x larger than wins.
+    # With 1:2 R/R, only need 33% win rate to break even. Current 54% should be profitable.
+    sl_atr_multiplier: float = 3.0   # v23.5: Give trades room through normal volatility
+    tp_atr_multiplier: float = 6.0   # v23.5: Achievable within NAS100 daily range (2x SL distance)
     
     # Risk Limits
     max_position_size: float = 5.0
@@ -221,13 +233,15 @@ class TradingConfig:
     reward_scaling: float = 0.01    # 1.0 reward per 100 points (NAS100 calibration)
 
     # Trade entry bonus: Offsets entry cost to encourage exploration
-    # NAS100 spread ~2.5 points × 0.01 = 0.025 reward cost, so bonus = 0.03
-    trade_entry_bonus: float = 0.0  # Pure PnL-driven (no entry bonus)
+    # NAS100 spread ~2.5 points × 0.01 = 0.025 reward cost, so bonus = 0.01
+    trade_entry_bonus: float = 0.01  # v23.5: Reduced to offset ~40% of spread cost
     
-    # v16: Sparse Rewards Mode
-    # If True: Only give rewards on trade EXIT (SL/TP/manual close)
-    # If False: Give continuous per-bar PnL delta rewards (causes scalping!)
-    use_sparse_rewards: bool = True  # EXIT-ONLY rewards to discourage scalping
+    # v21: Progressive Rewards Mode (replaces v16 sparse mode)
+    # Now using asymmetric rewards: reward profit increases, tolerate pullbacks
+    # - Profit increase → positive reward
+    # - Minor pullback (within loss_tolerance_atr) → ZERO reward (no penalty!)
+    # - Deep drawdown (beyond loss_tolerance_atr) → negative reward
+    use_sparse_rewards: bool = False  # Disabled - using progressive reward system
     
     # v17: Loss Tolerance Buffer (used with sparse_rewards=True)
     # Allow some drawdown before stopping per-bar rewards
@@ -236,9 +250,10 @@ class TradingConfig:
     loss_tolerance_atr: float = 1.5  # Allow 1.5x ATR drawdown before sparse mode kicks in
     
     # v18: Forced Minimum Hold Time
-    # Prevents scalping by blocking manual exits/flips before min_hold_bars is reached
-    # Agent CANNOT close/flip position until min_hold_bars have passed (SL/TP still work)
-    min_hold_bars: int = 12  # Must hold for 12 × 5min = 1 hour minimum
+    # WARNING: min_hold_bars > 0 BREAKS PPO! When action is blocked, the sampled action
+    # differs from executed action, causing wrong gradient updates.
+    # v23.2 FIX: MUST be 0. Use reward shaping (not action forcing) to discourage scalping.
+    min_hold_bars: int = 0  # v23.2: Disabled - action forcing breaks PPO gradients
     early_exit_profit_atr: float = 3.0  # Allow early exit if profit > 3x ATR (overrides min_hold_bars)
     break_even_atr: float = 2.0  # Move SL to break-even when profit reaches 2x ATR
     
@@ -259,19 +274,44 @@ class TradingConfig:
 
 
 @dataclass
+class RecurrentAgentConfig:
+    """RecurrentPPO (LSTM-based) Agent configuration - EXPERIMENTAL.
+
+    Uses sb3-contrib RecurrentPPO with MlpLstmPolicy for temporal pattern learning.
+    This allows the agent to build internal memory state across timesteps.
+    """
+    # Enable/disable recurrent mode (default: False = use standard PPO)
+    use_recurrent: bool = False  # Disabled - using standard PPO (no LSTM, no analyst)
+
+    # LSTM-specific hyperparameters
+    lstm_hidden_size: int = 128       # Reduced from default 256 for M2 8GB
+    n_lstm_layers: int = 1            # Single layer for efficiency
+    shared_lstm: bool = False         # Separate actor/critic LSTMs (more expressive)
+    enable_critic_lstm: bool = True   # LSTM for value function too
+
+    # RecurrentPPO typically needs smaller batch sizes due to sequence handling
+    # These override AgentConfig values when use_recurrent=True
+    n_steps: int = 512                # Smaller rollout (sequence memory overhead)
+    batch_size: int = 64              # Smaller batch for memory efficiency
+
+    # Network architecture (feeds into LSTM)
+    net_arch_pi: List[int] = field(default_factory=lambda: [128])  # Policy pre-LSTM
+    net_arch_vf: List[int] = field(default_factory=lambda: [128])  # Value pre-LSTM
+
+
+@dataclass
 class AgentConfig:
     """PPO Sniper Agent configuration."""
 
-    # PPO hyperparameters (from CLAUDE.md spec)
-    # FIX v15: Previous ent_coef (0.01) caused rapid policy collapse to flat.
-    # For a 12-action discrete space, higher entropy is needed to maintain exploration.
-    learning_rate: float = 2e-4  # Increased for batch_size=2048 (stable gradients)
-    n_steps: int = 8192         # Large rollout for sparse rewards + min_hold_bars
-    batch_size: int = 1024      # Reduced from 2048 for smoother learning
-    n_epochs: int = 10          # Reduced to prevent overfitting (was 20)
-    # Higher gamma reduces discounting, helping PPO value longer holds.
-    # v16: Increased to 0.999 for sparse exit-only rewards (agent must plan ahead)
-    gamma: float = 0.999
+    # PPO hyperparameters (v23: Fixed for continuous PnL rewards)
+    # Previous config had broken minibatch ratio (8192/1024=8 minibatches) which
+    # caused gradient noise with sparse rewards. Now using standard PPO setup.
+    learning_rate: float = 1e-4  # v23: Reduced from 2e-4 for stability
+    n_steps: int = 2048         # v23: Faster feedback (was 8192)
+    batch_size: int = 256       # v23: 2048/256 = 8 minibatches (was 1024)
+    n_epochs: int = 4           # v23: Reduced from 10 to prevent overfitting
+    # v23: Standard discount factor for trading (trade-level rewards, not episode-end)
+    gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     ent_coef: float = 0.05        # Initial value (decays to 0.001 via EntropyScheduleCallback)
@@ -279,7 +319,7 @@ class AgentConfig:
     max_grad_norm: float = 0.5
 
     # Training
-    total_timesteps: int = 500_000_000  # 500M steps (reduced from 1B to prevent overtraining)
+    total_timesteps: int = 1_000_000_000  # 1B steps (Increased back to 1B)
 
     # Policy network
     # FIX v15: [64, 64] may bottleneck for 49-dim input with 12-action output
@@ -303,7 +343,7 @@ class FeatureConfig:
     sr_lookback: int = 100            # S/R level lookback
 
     # Trend indicators
-    sma_period: int = 200
+    sma_period: int = 50
     ema_fast: int = 12
     ema_slow: int = 26
 
@@ -326,6 +366,7 @@ class Config:
     instrument: InstrumentConfig = field(default_factory=InstrumentConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    recurrent_agent: RecurrentAgentConfig = field(default_factory=RecurrentAgentConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
 
     # Global settings

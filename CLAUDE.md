@@ -60,7 +60,7 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 
 1. **Price Action Patterns**: Pinbar (wick > 2× body), Engulfing, Doji (body < 10% range)
 2. **Market Structure**: Fractal S/R levels, ATR-normalized distance to S/R
-3. **Trend Filters**: SMA(200) distance/ATR, EMA crossovers
+3. **Trend Filters**: SMA(50) distance/ATR, EMA crossovers
 4. **Regime Detection**: Choppiness Index (>61.8 = ranging, <38.2 = trending), ADX (>25 = trending)
 
 ## Key Implementation Details
@@ -85,16 +85,19 @@ Python 3.10+, PyTorch 2.0+, Stable Baselines 3, Gymnasium, Pandas, NumPy, pandas
 - Position state: [position, entry_price_norm, unrealized_pnl_norm]
 - Market features (normalized): [atr, chop, adx, regime, sma_distance]
 
-**Reward Function** (CRITICAL - uses continuous PnL delta, not exit-only):
+**Reward Function** (v23 - PURE continuous PnL delta):
 ```python
-# Continuous PnL: reward based on CHANGE in unrealized PnL each step
-pnl_delta = current_unrealized_pnl - prev_unrealized_pnl
-reward = pnl_delta * reward_scaling  # reward_scaling = 0.01 (NAS100: 1 reward per 100 points)
+# v23 CRITICAL FIX: Previous versions calculated pnl_delta but never added it to reward!
+# Only high-water mark crossings added reward, which was the root cause of non-learning.
+# Now using TRUE continuous PnL delta:
+if position != 0:
+    pnl_delta = current_unrealized_pnl - prev_unrealized_pnl
+    reward += pnl_delta * reward_scaling  # CORE FIX: Actually add the delta!
 
 # Transaction cost when opening (NOT closing)
 if opened_trade:
     reward -= spread_pips * position_size * reward_scaling
-    reward += trade_entry_bonus  # 0.03 to encourage exploration
+    reward += trade_entry_bonus  # 0.02 to offset ~80% of spread cost
 
 # FOMO: -0.5 if flat during high-momentum moves (|price_move| > 4*ATR)
 # Chop: disabled (was causing over-penalization)
@@ -216,6 +219,12 @@ except:
 - `fomo_penalty`: -0.5 (moderate penalty for missing moves)
 - `risk_pips_target`: 50.0 (volatility sizing reference)
 
+**Analyst Toggle** (for training PPO without analyst):
+- `use_analyst`: True (default) - train with full analyst context (32-dim embedding + 5-dim metrics)
+- `use_analyst`: False - train with only raw market features (no analyst loading, reduced observation space)
+- Toggle in `config/settings.py` → `TradingConfig.use_analyst`
+- Observation dims: ~68 with analyst, ~31 without analyst
+
 ## Common Pitfalls
 
 | Pitfall | Solution |
@@ -324,22 +333,25 @@ print(f"Train end: {train_end_idx}, Total samples: {len(df_15m)}")
 # Verify test env receives same train stats, NOT test stats
 ```
 
-## Current Hyperparameters (NAS100)
+## Current Hyperparameters (NAS100) - v23 Updated
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | `pip_value` | 1.0 | 1 point = 1.0 price movement |
 | `lot_size` | 1.0 | CFD lot ($1/point) |
-| `spread_pips` | 2.5 | NAS100 typical spread |
+| `spread_pips` | 2.5 | NAS100 typical spread (v23: was 6.0) |
 | `reward_scaling` | 0.01 | 1 reward per 100 points |
-| `ent_coef` | 0.01 | Exploration coefficient |
-| `fomo_penalty` | -0.5 | Punish inaction |
-| `trade_entry_bonus` | 0.03 | Offset spread cost |
+| `ent_coef` | 0.05→0.01 | v23: Phase decay over 100M steps (was 0.001 min) |
+| `fomo_penalty` | 0.0 | Disabled (FOMO was causing flat-only policy) |
+| `trade_entry_bonus` | 0.02 | v23: Offset ~80% of spread cost (was 0.0) |
+| `min_hold_bars` | 4 | v23: Prevent 1-bar scalps (was 0) |
 | `net_arch` | [256, 256] | Policy network |
-| `learning_rate` | 1e-4 | Standard |
-| `n_steps` | 2048 | Steps per update |
-| `batch_size` | 256 | Minibatch size |
-| `total_timesteps` | 200M | Long training run |
+| `learning_rate` | 1e-4 | v23: Reduced from 2e-4 for stability |
+| `n_steps` | 2048 | v23: Faster feedback (was 8192) |
+| `batch_size` | 256 | v23: Fixed minibatch ratio (was 1024) |
+| `n_epochs` | 4 | v23: Reduced from 10 to prevent overfitting |
+| `gamma` | 0.99 | v23: Standard discount (was 0.999) |
+| `total_timesteps` | 500M | Long training run |
 
 ## Training Progress Indicators
 

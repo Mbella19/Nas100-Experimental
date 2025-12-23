@@ -35,7 +35,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from ..models.analyst import load_analyst, MarketAnalyst
 from ..environments.trading_env import TradingEnv
-from ..agents.sniper_agent import SniperAgent, create_agent
+from ..agents.sniper_agent import SniperAgent, create_agent, create_agent_with_config
 from ..utils.logging_config import setup_logging, get_logger
 from ..utils.metrics import calculate_trading_metrics, TradingMetrics
 from ..data.features import (
@@ -588,6 +588,7 @@ def create_trading_env(
     ohlc_data: Optional[np.ndarray] = None,         # Real OHLC for visualization
     timestamps: Optional[np.ndarray] = None,        # Real timestamps for visualization
     returns: Optional[np.ndarray] = None,           # Returns for Full Eyes
+    use_analyst: bool = True,                       # Toggle analyst usage
 ) -> TradingEnv:
     """
     Create the trading environment.
@@ -606,7 +607,7 @@ def create_trading_env(
     # Default configuration (matches config/settings.py v16 fixes)
     # FIX v16: After fixing mixed PnL units and inverted entry_price_norm,
     # these defaults now produce correct reward signals
-    spread_pips = 3.0       # Razor/Raw spread
+    spread_pips = 3.5       # NAS100 spread with buffer
     slippage_pips = 0.0     # Includes commission + slippage
     fomo_penalty = 0.0     # Moderate penalty for missing high-momentum moves
     chop_penalty = 0.0      # Disabled
@@ -619,8 +620,9 @@ def create_trading_env(
     noise_level = 0.01         # Default: no observation noise unless configured
 
     # Risk Management defaults
-    sl_atr_multiplier = 2.0  # v17: Tighter SL for 1:6 R:R
-    tp_atr_multiplier = 12.0
+    # v23.6: Updated to 1:2 R/R (was 2.0/12.0 = 1:6 inverted R/R)
+    sl_atr_multiplier = 3.0  # v23.5: Give trades room through normal volatility
+    tp_atr_multiplier = 6.0  # v23.5: Achievable TP (2x SL distance for 1:2 R/R)
     use_stop_loss = True
     use_take_profit = True
 
@@ -683,6 +685,9 @@ def create_trading_env(
                     f"enforce_analyst_alignment={enforce_analyst_alignment}, noise_level={noise_level}, "
                     f"use_sparse_rewards={use_sparse_rewards}, loss_tolerance_atr={loss_tolerance_atr}, "
                     f"min_hold_bars={min_hold_bars}")
+        # v23.6: Log SL/TP values to verify 1:2 R/R is applied
+        logger.info(f"SL/TP config: sl_atr_multiplier={sl_atr_multiplier}, tp_atr_multiplier={tp_atr_multiplier} "
+                    f"(R/R ratio: 1:{tp_atr_multiplier/sl_atr_multiplier:.1f})")
 
     if analyst_model is not None:
         context_dim = analyst_model.context_dim
@@ -746,6 +751,8 @@ def create_trading_env(
         # Full Eyes Features
         returns=returns,
         agent_lookback_window=getattr(trading_cfg, 'agent_lookback_window', 6) if config is not None else 6,
+        # Toggle Analyst usage
+        use_analyst=use_analyst,
     )
 
     return env
@@ -762,9 +769,12 @@ def train_agent(
     device: Optional[torch.device] = None,
     total_timesteps: int = 500_000,
     resume_path: Optional[str] = None
-) -> Tuple[SniperAgent, Dict]:
+) -> Tuple['SniperAgent | RecurrentSniperAgent', Dict]:
     """
     Main function to train the PPO Sniper Agent.
+
+    Supports both standard PPO (SniperAgent) and RecurrentPPO (RecurrentSniperAgent)
+    based on config.recurrent_agent.use_recurrent setting.
 
     Args:
         df_15m: 15-minute DataFrame with features
@@ -776,6 +786,7 @@ def train_agent(
         config: Configuration object
         device: Torch device
         total_timesteps: Total training timesteps
+        resume_path: Optional path to resume from checkpoint
 
     Returns:
         Tuple of (trained agent, training info)
@@ -791,27 +802,38 @@ def train_agent(
     device = torch.device("cpu")
     logger.info("Training PPO agent on device: cpu")
 
-    # Load frozen analyst
-    logger.info(f"Loading analyst from {analyst_path}")
+    # Check if analyst should be used (toggle from config)
+    use_analyst = getattr(config.trading, 'use_analyst', True) if config else True
+
     from src.live.bridge_constants import MODEL_FEATURE_COLS
     required_feature_cols = list(MODEL_FEATURE_COLS)
 
     if feature_cols != required_feature_cols:
         logger.warning("Overriding `feature_cols` with canonical MODEL_FEATURE_COLS ordering.")
         feature_cols = required_feature_cols
-    
-    # TCNAnalyst expects true timeframe keys in this system
-    feature_dims = {
-        '5m': len(feature_cols),
-        '15m': len(feature_cols),
-        '45m': len(feature_cols)
-    }
-    analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
-    logger.info("Analyst loaded and frozen")
 
-    # Log analyst info
-    logger.info(f"Analyst context_dim: {analyst.context_dim}")
-    logger.info(f"Analyst parameters: {sum(p.numel() for p in analyst.parameters()):,} (frozen)")
+    if use_analyst:
+        # Load frozen analyst
+        logger.info(f"Loading analyst from {analyst_path}")
+
+        # TCNAnalyst expects true timeframe keys in this system
+        feature_dims = {
+            '5m': len(feature_cols),
+            '15m': len(feature_cols),
+            '45m': len(feature_cols)
+        }
+        analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
+        logger.info("Analyst loaded and frozen")
+
+        # Log analyst info
+        logger.info(f"Analyst context_dim: {analyst.context_dim}")
+        logger.info(f"Analyst parameters: {sum(p.numel() for p in analyst.parameters()):,} (frozen)")
+    else:
+        logger.info("=" * 70)
+        logger.info("ANALYST DISABLED (use_analyst=False)")
+        logger.info("Agent will train with RAW MARKET FEATURES ONLY")
+        logger.info("=" * 70)
+        analyst = None
 
     # Prepare data
     logger.info("Preparing environment data...")
@@ -941,42 +963,45 @@ def train_agent(
     }
     logger.info(f"Regime distribution: {regime_counts}")
 
-    # Try to load pre-computed Analyst cache for sequential context
+    # Try to load pre-computed Analyst cache for sequential context (only if use_analyst=True)
     analyst_cache_path = Path(save_path).parent.parent / 'data' / 'processed' / 'analyst_cache.npz'
     train_analyst_cache = None
     eval_analyst_cache = None
-    
-    if analyst_cache_path.exists():
-        logger.info(f"Loading pre-computed Analyst cache from {analyst_cache_path}")
-        try:
-            from .precompute_analyst import load_cached_analyst_outputs
-            full_cache = load_cached_analyst_outputs(str(analyst_cache_path))
-            
-            # Split cache to match train/eval split
-            cache_split_idx = split_idx
-            train_analyst_cache = {
-                'contexts': full_cache['contexts'][:cache_split_idx],
-                'probs': full_cache['probs'][:cache_split_idx],
-                # DISABLED ACTIVATIONS TO SAVE MEMORY (OOM Protection)
-                'activations_15m': None, 
-                'activations_1h': None,
-                'activations_4h': None,
-            }
-            eval_analyst_cache = {
-                'contexts': full_cache['contexts'][cache_split_idx:],
-                'probs': full_cache['probs'][cache_split_idx:],
-                # DISABLED ACTIVATIONS TO SAVE MEMORY (OOM Protection)
-                'activations_15m': None,
-                'activations_1h': None,
-                'activations_4h': None,
-            }
-            logger.info(f"Using sequential Analyst context: train={len(train_analyst_cache['contexts'])}, eval={len(eval_analyst_cache['contexts'])}")
-        except Exception as e:
-            logger.warning(f"Failed to load Analyst cache: {e}")
-            logger.info("Falling back to standard precomputation")
+
+    if use_analyst:
+        if analyst_cache_path.exists():
+            logger.info(f"Loading pre-computed Analyst cache from {analyst_cache_path}")
+            try:
+                from .precompute_analyst import load_cached_analyst_outputs
+                full_cache = load_cached_analyst_outputs(str(analyst_cache_path))
+
+                # Split cache to match train/eval split
+                cache_split_idx = split_idx
+                train_analyst_cache = {
+                    'contexts': full_cache['contexts'][:cache_split_idx],
+                    'probs': full_cache['probs'][:cache_split_idx],
+                    # DISABLED ACTIVATIONS TO SAVE MEMORY (OOM Protection)
+                    'activations_15m': None,
+                    'activations_1h': None,
+                    'activations_4h': None,
+                }
+                eval_analyst_cache = {
+                    'contexts': full_cache['contexts'][cache_split_idx:],
+                    'probs': full_cache['probs'][cache_split_idx:],
+                    # DISABLED ACTIVATIONS TO SAVE MEMORY (OOM Protection)
+                    'activations_15m': None,
+                    'activations_1h': None,
+                    'activations_4h': None,
+                }
+                logger.info(f"Using sequential Analyst context: train={len(train_analyst_cache['contexts'])}, eval={len(eval_analyst_cache['contexts'])}")
+            except Exception as e:
+                logger.warning(f"Failed to load Analyst cache: {e}")
+                logger.info("Falling back to standard precomputation")
+        else:
+            logger.info("No pre-computed Analyst cache found. Using standard precomputation.")
+            logger.info(f"To enable sequential context, run: python src/training/precompute_analyst.py")
     else:
-        logger.info("No pre-computed Analyst cache found. Using standard precomputation.")
-        logger.info(f"To enable sequential context, run: python src/training/precompute_analyst.py")
+        logger.info("Skipping Analyst cache loading (use_analyst=False)")
 
     # Create training environment
     # FIX: ENABLE regime sampling to balance training across market regimes
@@ -992,7 +1017,7 @@ def train_agent(
         data_4h=train_data[2],
         close_prices=train_data[3],
         market_features=train_data[4],
-        returns=train_data[5], # Pass returns
+        returns=train_data[5],  # Pass returns
         analyst_model=analyst,
         config=config,
         device=device,
@@ -1003,6 +1028,7 @@ def train_agent(
         precomputed_analyst_cache=train_analyst_cache,
         ohlc_data=train_ohlc,
         timestamps=viz_timestamps,
+        use_analyst=use_analyst,
     )
 
     logger.info("Creating evaluation environment...")
@@ -1012,7 +1038,7 @@ def train_agent(
         data_4h=eval_data[2],
         close_prices=eval_data[3],
         market_features=eval_data[4],
-        returns=eval_data[5], # Pass returns
+        returns=eval_data[5],  # Pass returns
         analyst_model=analyst,
         config=config,
         device=device,
@@ -1023,6 +1049,7 @@ def train_agent(
         precomputed_analyst_cache=eval_analyst_cache,  # Use sequential context if available
         ohlc_data=eval_ohlc,            # Real OHLC for visualization
         timestamps=eval_timestamps,      # Real timestamps for visualization
+        use_analyst=use_analyst,
     )
 
     # Log environment info
@@ -1032,6 +1059,19 @@ def train_agent(
     # Wrap environments
     train_env = Monitor(train_env)
     eval_env = Monitor(eval_env)
+
+    # Detect recurrent mode from config
+    recurrent_cfg = getattr(config, 'recurrent_agent', None) if config else None
+    use_recurrent = recurrent_cfg.use_recurrent if recurrent_cfg else False
+
+    if use_recurrent:
+        logger.info("=" * 70)
+        logger.info("RECURRENT PPO (LSTM) MODE - EXPERIMENTAL")
+        logger.info("=" * 70)
+        logger.info(f"  LSTM hidden_size: {recurrent_cfg.lstm_hidden_size}")
+        logger.info(f"  n_lstm_layers: {recurrent_cfg.n_lstm_layers}")
+        logger.info(f"  n_steps: {recurrent_cfg.n_steps}, batch_size: {recurrent_cfg.batch_size}")
+        logger.info("=" * 70)
 
     # Create agent
     reset_timesteps = True
@@ -1045,22 +1085,27 @@ def train_agent(
                 "Expected a SB3 .zip checkpoint like: models/checkpoints/sniper_model_7400000_steps.zip"
             )
 
-        logger.info(f"Resuming PPO agent from checkpoint: {resume_p}")
+        logger.info(f"Resuming agent from checkpoint: {resume_p}")
         try:
-            agent = SniperAgent.load(str(resume_p), env=train_env, device=device)
+            if use_recurrent:
+                from ..agents.recurrent_agent import RecurrentSniperAgent
+                agent = RecurrentSniperAgent.load(str(resume_p), env=train_env, device=device)
+            else:
+                agent = SniperAgent.load(str(resume_p), env=train_env, device=device)
         except Exception as e:
             logger.error(
-                "Failed to resume PPO from checkpoint. Most common causes:\n"
+                "Failed to resume from checkpoint. Most common causes:\n"
                 "- Observation space changed (e.g. added/removed features, changed `agent_lookback_window`, "
                 "or market feature columns)\n"
                 "- Action space changed\n"
+                "- Model type mismatch (PPO vs RecurrentPPO)\n"
                 f"Checkpoint: {resume_p}\n"
                 f"Env obs shape: {getattr(train_env.observation_space, 'shape', None)}\n"
                 f"Env action space: {train_env.action_space}\n"
                 f"Error: {e}"
             )
             raise
-        
+
         # Force-update Exploration Rate (Entropy Coefficient) from current config
         # This allows "shock therapy" (increasing exploration) on resumed models
         if config is not None and hasattr(config, "agent") and hasattr(config.agent, 'ent_coef'):
@@ -1077,7 +1122,7 @@ def train_agent(
             new_gamma = config.agent.gamma
             agent.model.gamma = new_gamma
             logger.info(f"Gamma UPDATED: {current_gamma} -> {new_gamma}")
-        
+
         # Calculate remaining steps
         current_timesteps = agent.model.num_timesteps
         # Ensure we run for at least 10k steps if completed or close to completion,
@@ -1085,14 +1130,17 @@ def train_agent(
         # If user wants to EXTEND training, they should increase total_timesteps in config.
         remaining_timesteps = max(10000, total_timesteps - current_timesteps)
         reset_timesteps = False
-        
+
         logger.info(f"Resumed from step {current_timesteps:,}. Target: {total_timesteps:,}.")
         logger.info(f"Remaining timesteps: {remaining_timesteps:,}")
         logger.info("Learning Rate Schedule will CONTINUE from current step (NOT reset).")
-        
+
     else:
-        logger.info("Creating PPO agent...")
-        agent = create_agent(train_env, config.agent, device=device)
+        if use_recurrent:
+            logger.info("Creating RecurrentPPO (LSTM) agent...")
+        else:
+            logger.info("Creating PPO agent...")
+        agent = create_agent_with_config(train_env, config, device=device)
         remaining_timesteps = total_timesteps
         reset_timesteps = True
 

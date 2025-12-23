@@ -312,7 +312,7 @@ def distance_to_nearest_sr(
 # Trend Filters
 # =============================================================================
 
-def sma(df: pd.DataFrame, period: int = 200) -> pd.Series:
+def sma(df: pd.DataFrame, period: int = 50) -> pd.Series:
     """Simple Moving Average."""
     return df['close'].rolling(window=period).mean().astype(np.float32)
 
@@ -325,10 +325,10 @@ def ema(df: pd.DataFrame, period: int) -> pd.Series:
 def sma_distance(
     df: pd.DataFrame,
     atr: pd.Series,
-    period: int = 200
+    period: int = 50
 ) -> pd.Series:
     """
-    Calculate ATR-normalized distance from SMA(200).
+    Calculate ATR-normalized distance from SMA(period).
 
     Positive = price above SMA (bullish)
     Negative = price below SMA (bearish)
@@ -639,7 +639,7 @@ def engineer_all_features(
             'doji_body_ratio': 0.1,
             'fractal_window': 5,
             'sr_lookback': 100,
-            'sma_period': 200,
+            'sma_period': 50,
             'ema_fast': 12,
             'ema_slow': 26,
             'chop_period': 14,
