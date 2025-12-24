@@ -205,6 +205,7 @@ def _build_observation(
     entry_price: float,
     current_price: float,
     position_size: float,
+    time_in_trade_norm: float = 0.0,  # v25: How long held (0-1)
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Construct an observation vector with the same ordering as TradingEnv._get_observation().
@@ -266,7 +267,8 @@ def _build_observation(
         entry_price_norm = 0.0
         unrealized_pnl_norm = 0.0
 
-    position_state = np.array([float(position), entry_price_norm, unrealized_pnl_norm], dtype=np.float32)
+    # v25: Position state now has 4 elements (matching TradingEnv)
+    position_state = np.array([float(position), entry_price_norm, unrealized_pnl_norm, time_in_trade_norm], dtype=np.float32)
 
     # Market feature normalization (second-stage zscore used in env)
     # Ensure the incoming row ordering matches the saved stats ordering.
@@ -389,7 +391,8 @@ class MT5BridgeState:
         analyst_metrics_dim = 5 if int(getattr(self.analyst, "num_classes", 2)) == 2 else 6
         n_market = len(MARKET_FEATURE_COLS)
         returns_dim = int(self.system_cfg.trading.agent_lookback_window)
-        return context_dim + 3 + n_market + analyst_metrics_dim + 2 + returns_dim
+        # v25: Position now has 4 elements: [position, entry_price_norm, unrealized_pnl_norm, time_in_trade_norm]
+        return context_dim + 4 + n_market + analyst_metrics_dim + 2 + returns_dim
 
     def update_from_payload(self, payload: Dict[str, Any]) -> None:
         utc_offset_sec = int(payload.get("time", {}).get("utc_offset_sec", 0))
@@ -587,6 +590,13 @@ class MT5BridgeState:
                 entry_pos = self._fallback_entry_pos
                 entry_label_utc = self._fallback_entry_label_utc
 
+        # v25: Calculate time in trade (normalized to [0, 1])
+        if position != 0 and entry_pos is not None:
+            bars_held_for_obs = max(0, int(pos - entry_pos))
+            time_in_trade_norm = min(bars_held_for_obs / 100.0, 1.0)
+        else:
+            time_in_trade_norm = 0.0
+
         obs, obs_info = _build_observation(
             analyst=self.analyst,
             agent_env_cfg=self.system_cfg,
@@ -600,6 +610,7 @@ class MT5BridgeState:
             entry_price=entry_price,
             current_price=current_price,
             position_size=position_size,
+            time_in_trade_norm=time_in_trade_norm,  # v25: Pass time in trade
         )
 
         if self.cfg.dry_run:

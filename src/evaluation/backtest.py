@@ -54,7 +54,7 @@ class Backtester:
         lot_size: float = 1.0,        # NAS100 CFD: $1 per point (was 100000 for EURUSD)
         point_multiplier: float = 1.0,  # PnL: points × pip_value × lot_size × multiplier = $1/point
         # Risk Management (MUST match TradingConfig for 1:1 training parity)
-        sl_atr_multiplier: float = 3.0,   # v23.1: Match config/settings.py TradingConfig (was 2.0)
+        sl_atr_multiplier: float = 2.0,   # v24: Tighter SL at 2x ATR for better R:R
         tp_atr_multiplier: float = 6.0,   # v23.1: Match config/settings.py TradingConfig (was 12.0)
         use_stop_loss: bool = True,
         use_take_profit: bool = True,
@@ -469,7 +469,7 @@ def run_backtest(
     start_idx: Optional[int] = None,
     max_steps: Optional[int] = None,
     # Risk Management (MUST match TradingConfig for 1:1 training parity)
-    sl_atr_multiplier: float = 3.0,    # v23.1: Match config/settings.py TradingConfig (was 2.0)
+    sl_atr_multiplier: float = 2.0,    # v24: Tighter SL at 2x ATR for better R:R
     tp_atr_multiplier: float = 6.0,    # v23.1: Match config/settings.py TradingConfig (was 12.0)
     use_stop_loss: bool = True,
     use_take_profit: bool = True,

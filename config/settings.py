@@ -193,7 +193,7 @@ class TradingConfig:
     """Trading environment configuration for NAS100."""
     # Toggle Market Analyst usage
     # If False, agent trains with only raw market features (no analyst context/metrics)
-    use_analyst: bool = True  # v23: Re-enabled for directional context
+    use_analyst: bool = False  # v24: Disabled - agent trains with raw features only
 
     spread_pips: float = 3.5    # NAS100 spread with buffer for realistic execution
     slippage_pips: float = 0.0  # NAS100 slippage
@@ -205,7 +205,7 @@ class TradingConfig:
     # If True, Agent can ONLY trade in direction of Analyst (or Flat)
     # When enabled, if agent tries to trade against analyst prediction, action is forced to Flat
     # This constrains the agent to follow the Analyst's directional conviction
-    enforce_analyst_alignment: bool = True  # ENABLED - Agent must align with Analyst direction
+    enforce_analyst_alignment: bool = False  # v24: Disabled when use_analyst=False
     
     # NEW: Risk-Based Sizing (Not Fixed Lots)
     risk_multipliers: Tuple[float, ...] = (1.5, 2.0, 2.5, 3.0)
@@ -214,7 +214,7 @@ class TradingConfig:
     # v23.5 FIX: Changed from 2.0/12.0 (1:6 inverted R/R) to 3.0/6.0 (1:2 standard R/R)
     # Training logs showed 54% win rate but negative PnL because losses were 6x larger than wins.
     # With 1:2 R/R, only need 33% win rate to break even. Current 54% should be profitable.
-    sl_atr_multiplier: float = 3.0   # v23.5: Give trades room through normal volatility
+    sl_atr_multiplier: float = 2.0   # v24: Tighter SL at 2x ATR for better R:R (was 3.0)
     tp_atr_multiplier: float = 6.0   # v23.5: Achievable within NAS100 daily range (2x SL distance)
     
     # Risk Limits
@@ -226,7 +226,7 @@ class TradingConfig:
     # Reward Params (calibrated for NAS100)
     # NAS100 has ~100-200 point daily range vs EURUSD ~50-100 pip range
     # reward_scaling = 0.01 means 100 points = 1.0 reward (similar magnitude to EURUSD)
-    fomo_penalty: float = 0.0    # Moderate penalty for missing high-momentum moves
+    fomo_penalty: float = -0.5     # Moderate penalty for missing high-momentum moves
     chop_penalty: float = 0.0     # Disabled (can cause over-penalization in legitimate ranging trades)
     fomo_threshold_atr: float = 4.0  # Trigger on >4x ATR moves
     chop_threshold: float = 80.0     # Only extreme chop triggers penalty
@@ -241,7 +241,7 @@ class TradingConfig:
     # - Profit increase → positive reward
     # - Minor pullback (within loss_tolerance_atr) → ZERO reward (no penalty!)
     # - Deep drawdown (beyond loss_tolerance_atr) → negative reward
-    use_sparse_rewards: bool = False  # Disabled - using progressive reward system
+    use_sparse_rewards: bool = False  # v25: DISABLED - causes mode collapse to Flat
     
     # v17: Loss Tolerance Buffer (used with sparse_rewards=True)
     # Allow some drawdown before stopping per-bar rewards
@@ -311,7 +311,7 @@ class AgentConfig:
     batch_size: int = 256       # v23: 2048/256 = 8 minibatches (was 1024)
     n_epochs: int = 4           # v23: Reduced from 10 to prevent overfitting
     # v23: Standard discount factor for trading (trade-level rewards, not episode-end)
-    gamma: float = 0.99
+    gamma: float = 0.995  # v25: Higher gamma encourages longer holds (was 0.95)
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     ent_coef: float = 0.05        # Initial value (decays to 0.001 via EntropyScheduleCallback)

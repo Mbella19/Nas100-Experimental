@@ -609,7 +609,7 @@ def create_trading_env(
     # these defaults now produce correct reward signals
     spread_pips = 3.5       # NAS100 spread with buffer
     slippage_pips = 0.0     # Includes commission + slippage
-    fomo_penalty = 0.0     # Moderate penalty for missing high-momentum moves
+    fomo_penalty = -0.5   # v24: Match config/settings.py
     chop_penalty = 0.0      # Disabled
     fomo_threshold_atr = 4.0  # Trigger on >1.5x ATR moves
     chop_threshold = 80.0   # Only extreme chop triggers penalty
@@ -621,7 +621,7 @@ def create_trading_env(
 
     # Risk Management defaults
     # v23.6: Updated to 1:2 R/R (was 2.0/12.0 = 1:6 inverted R/R)
-    sl_atr_multiplier = 3.0  # v23.5: Give trades room through normal volatility
+    sl_atr_multiplier = 2.0  # v24: Tighter SL at 2x ATR for better R:R (was 3.0)
     tp_atr_multiplier = 6.0  # v23.5: Achievable TP (2x SL distance for 1:2 R/R)
     use_stop_loss = True
     use_take_profit = True

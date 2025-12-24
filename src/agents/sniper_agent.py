@@ -55,23 +55,23 @@ class EntropyScheduleCallback(BaseCallback):
     """
     Callback with 4-phase stepped entropy for 1B timestep training.
 
-    v24: Extended to 4 phases for 1B training run.
+    v24: More aggressive decay - faster convergence to confident policies.
 
-    Phase 1 (0-200M):     ent_coef = 0.10  (extra high explore)
-    Phase 2 (200M-500M):  ent_coef = 0.05  (explore)
-    Phase 3 (500M-800M):  ent_coef = 0.02  (transition)
-    Phase 4 (800M-1B):    ent_coef = 0.01  (exploit - never below 0.01!)
+    Phase 1 (0-50M):      ent_coef = 0.05  (explore - but not too random)
+    Phase 2 (50M-150M):   ent_coef = 0.02  (transition)
+    Phase 3 (150M-300M):  ent_coef = 0.01  (exploit)
+    Phase 4 (300M+):      ent_coef = 0.005 (confident policies)
     """
 
     def __init__(
         self,
-        phase1_steps: int = 200_000_000,  # First 200M: extra high explore
-        phase2_steps: int = 300_000_000,  # Next 300M (200M-500M): explore
-        phase3_steps: int = 300_000_000,  # Next 300M (500M-800M): transition
-        phase1_ent: float = 0.10,         # Extra high exploration
-        phase2_ent: float = 0.05,         # Explore entropy
-        phase3_ent: float = 0.02,         # Transition entropy
-        phase4_ent: float = 0.01,         # Exploit entropy (never below 0.01!)
+        phase1_steps: int = 50_000_000,   # Only 50M at higher explore (was 200M)
+        phase2_steps: int = 100_000_000,  # Next 100M (50M-150M): transition
+        phase3_steps: int = 150_000_000,  # Next 150M (150M-300M): exploit
+        phase1_ent: float = 0.05,         # Start lower (was 0.10) - less random
+        phase2_ent: float = 0.02,         # Transition entropy
+        phase3_ent: float = 0.01,         # Exploit entropy
+        phase4_ent: float = 0.005,        # Allow confident policies (was 0.01)
         verbose: int = 0
     ):
         super().__init__(verbose)
@@ -357,8 +357,9 @@ class SniperAgent:
             TrainingMetricsCallback(log_freq=2000, verbose=self.verbose),
             # Entropy Schedule: Stepped phases (uses class defaults)
             # Phase 1 (0-50M): explore @ 0.05
-            # Phase 2 (50M-100M): transition @ 0.02
-            # Phase 3 (100M+): exploit @ 0.01 (never below 0.01!)
+            # Phase 2 (50M-150M): transition @ 0.02
+            # Phase 3 (150M-300M): exploit @ 0.01
+            # Phase 4 (300M+): confident @ 0.005
             EntropyScheduleCallback(verbose=self.verbose)
         ]
 

@@ -75,7 +75,7 @@ class TradingEnv(gym.Env):
         point_multiplier: float = 1.0, # Dollar per point per lot
         spread_pips: float = 3.5,     # NAS100 spread with buffer
         slippage_pips: float = 0.0,   # NAS100 slippage
-        fomo_penalty: float = 0.0,   # v15: Meaningful penalty for missing moves (was 0.0)
+        fomo_penalty: float = -0.5,   # v24: Penalty for missing moves when Flat
         chop_penalty: float = 0.0,    # Disabled for stability
         fomo_threshold_atr: float = 4.0,  # v15: Trigger on >1.5x ATR moves (was 2.0)
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
@@ -87,8 +87,8 @@ class TradingEnv(gym.Env):
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
         pre_windowed: bool = True,  # FIXED: If True, data is already windowed (start_idx=0)
         # Risk Management
-        sl_atr_multiplier: float = 2.0, # v17: Stop Loss = ATR * 2 (tighter for 1:6 R:R)
-        tp_atr_multiplier: float = 12.0, # Take Profit = ATR * multiplier
+        sl_atr_multiplier: float = 2.0, # v24: Tighter SL at 2x ATR (was 3.0)
+        tp_atr_multiplier: float = 6.0, # v24: 1:3 R/R ratio with SL=2.0 (was 12.0)
         use_stop_loss: bool = True,     # Enable/disable stop-loss
         use_take_profit: bool = True,   # Enable/disable take-profit
         # Regime-balanced sampling
@@ -108,7 +108,7 @@ class TradingEnv(gym.Env):
         timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
         noise_level: float = 0.001,  # Anti-overfitting noise (default enabled)
         # v16: Sparse Rewards Mode
-        use_sparse_rewards: bool = True,  # If True, only give reward on trade exit (not per-bar)
+        use_sparse_rewards: bool = False,  # v25: DISABLED - causes mode collapse
         # v17: Loss Tolerance Buffer
         loss_tolerance_atr: float = 0.5,  # Allow this much ATR drawdown before sparse mode kicks in
         # v18: Forced Minimum Hold Time
@@ -279,8 +279,9 @@ class TradingEnv(gym.Env):
             analyst_metrics_dim = 0
             print("Analyst DISABLED - agent using raw market features only")
 
-        # Obs Dim = Context + Position(3) + Market + Analyst + SL/TP(2) + Returns
-        obs_dim = effective_context_dim + 3 + n_market_features + analyst_metrics_dim + 2 + self.agent_lookback_window
+        # Obs Dim = Context + Position(4) + Market + Analyst + SL/TP(2) + Returns
+        # v25: Position now has 4 elements: [position, entry_price_norm, unrealized_pnl_norm, time_in_trade_norm]
+        obs_dim = effective_context_dim + 4 + n_market_features + analyst_metrics_dim + 2 + self.agent_lookback_window
 
         # Store effective dimensions for _get_observation
         self.effective_context_dim = effective_context_dim
@@ -567,10 +568,19 @@ class TradingEnv(gym.Env):
             entry_price_norm = 0.0
             unrealized_pnl_norm = 0.0
 
+        # v25: Add time in trade (normalized to [0, 1])
+        # This helps agent understand how long it's been holding - prevents scalping
+        if self.position != 0:
+            bars_held = self.current_idx - self.entry_idx
+            time_in_trade_norm = min(bars_held / 100.0, 1.0)  # Caps at 100 bars
+        else:
+            time_in_trade_norm = 0.0
+
         position_state = np.array([
             float(self.position),
             entry_price_norm,
-            unrealized_pnl_norm
+            unrealized_pnl_norm,
+            time_in_trade_norm  # NEW: How long held (0 = just entered, 1 = 100+ bars)
         ], dtype=np.float32)
 
         # Market features (NORMALIZED to prevent scale inconsistencies)
@@ -758,7 +768,11 @@ class TradingEnv(gym.Env):
                 self._holding_bonus_level = 0
                 self.break_even_activated = False  # v20: Reset break-even
 
-                sl_reward = final_delta * self.reward_scaling
+                # v24 FIX: In sparse mode, reward FULL trade PnL
+                if self.use_sparse_rewards:
+                    sl_reward = pnl * self.reward_scaling
+                else:
+                    sl_reward = final_delta * self.reward_scaling
 
                 return sl_reward, {
                     'stop_loss_triggered': True,
@@ -794,7 +808,11 @@ class TradingEnv(gym.Env):
                 self._holding_bonus_paid = 0.0
                 self._holding_bonus_level = 0
 
-                tp_reward = final_delta * self.reward_scaling
+                # v24 FIX: In sparse mode, reward FULL trade PnL
+                if self.use_sparse_rewards:
+                    tp_reward = pnl * self.reward_scaling
+                else:
+                    tp_reward = final_delta * self.reward_scaling
 
                 return tp_reward, {
                     'take_profit_triggered': True,
@@ -835,7 +853,11 @@ class TradingEnv(gym.Env):
                 self._holding_bonus_paid = 0.0
                 self._holding_bonus_level = 0
 
-                sl_reward = final_delta * self.reward_scaling
+                # v24 FIX: In sparse mode, reward FULL trade PnL
+                if self.use_sparse_rewards:
+                    sl_reward = pnl * self.reward_scaling
+                else:
+                    sl_reward = final_delta * self.reward_scaling
 
                 return sl_reward, {
                     'stop_loss_triggered': True,
@@ -871,7 +893,11 @@ class TradingEnv(gym.Env):
                 self._holding_bonus_paid = 0.0
                 self._holding_bonus_level = 0
 
-                tp_reward = final_delta * self.reward_scaling
+                # v24 FIX: In sparse mode, reward FULL trade PnL
+                if self.use_sparse_rewards:
+                    tp_reward = pnl * self.reward_scaling
+                else:
+                    tp_reward = final_delta * self.reward_scaling
 
                 return tp_reward, {
                     'take_profit_triggered': True,
@@ -1040,7 +1066,13 @@ class TradingEnv(gym.Env):
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 pnl_delta += final_delta
-                reward += final_delta * self.reward_scaling
+                
+                # v24 FIX: In sparse mode, reward FULL trade PnL (not just final delta)
+                # because no per-bar rewards were given during the trade
+                if self.use_sparse_rewards:
+                    reward += final_unrealized * self.reward_scaling
+                else:
+                    reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus was causing reward-PnL divergence
                 # The bonus (+2.5 for ANY profitable trade) was 50x larger than
@@ -1076,7 +1108,12 @@ class TradingEnv(gym.Env):
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 pnl_delta += final_delta
-                reward += final_delta * self.reward_scaling
+                
+                # v24 FIX: In sparse mode, reward FULL trade PnL
+                if self.use_sparse_rewards:
+                    reward += final_unrealized * self.reward_scaling
+                else:
+                    reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus (see comment in Flat/Exit case above)
 
@@ -1128,7 +1165,12 @@ class TradingEnv(gym.Env):
                 final_unrealized = self._calculate_unrealized_pnl()
                 final_delta = final_unrealized - self.prev_unrealized_pnl
                 pnl_delta += final_delta
-                reward += final_delta * self.reward_scaling
+                
+                # v24 FIX: In sparse mode, reward FULL trade PnL
+                if self.use_sparse_rewards:
+                    reward += final_unrealized * self.reward_scaling
+                else:
+                    reward += final_delta * self.reward_scaling
 
                 # REMOVED: Direction bonus (see comment in Flat/Exit case above)
 
@@ -1182,19 +1224,22 @@ class TradingEnv(gym.Env):
         #   - Price moves against → negative reward
         #   - Agent learns "price up = good for long, price down = bad for long"
         #
-        # CRITICAL FIX: Previous versions calculated pnl_delta but never added it
-        # to reward! Only high-water mark crossings added reward, which created
-        # asymmetric incentives and prevented learning.
+        # v24 FIX: Only apply continuous rewards if sparse mode is DISABLED.
+        # When use_sparse_rewards=True, agent only gets reward on trade exit.
         if self.position != 0:
             current_unrealized_pnl = self._calculate_unrealized_pnl()
             pnl_delta = current_unrealized_pnl - self.prev_unrealized_pnl
 
-            # CORE FIX: Actually add the PnL delta to reward!
-            reward += pnl_delta * self.reward_scaling
+            # v24: Only add per-bar PnL if NOT using sparse rewards
+            if not self.use_sparse_rewards:
+                reward += pnl_delta * self.reward_scaling
+                info['reward_type'] = 'continuous_pnl'
+            else:
+                # Sparse mode: track delta but don't reward until exit
+                info['reward_type'] = 'sparse_holding'
 
             info['unrealized_pnl'] = current_unrealized_pnl
             info['pnl_delta'] = pnl_delta
-            info['reward_type'] = 'continuous_pnl'
             self.prev_unrealized_pnl = current_unrealized_pnl
         else:
             # Position is flat - ensure tracking is reset
@@ -1312,7 +1357,11 @@ class TradingEnv(gym.Env):
             final_unrealized = pnl_pips * self.position_size
             final_delta = final_unrealized - self.prev_unrealized_pnl
 
-            forced_close_reward = final_delta * self.reward_scaling
+            # v24 FIX: In sparse mode, reward FULL trade PnL
+            if self.use_sparse_rewards:
+                forced_close_reward = final_unrealized * self.reward_scaling
+            else:
+                forced_close_reward = final_delta * self.reward_scaling
             reward += forced_close_reward
 
             self.total_pnl += final_unrealized
@@ -1511,12 +1560,12 @@ def create_env_from_dataframes(
     # Extract config values (defaults for NAS100)
     pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
     spread_pips = 3.5  # NAS100 spread with buffer
-    fomo_penalty = -0.05  # Reduced from -0.5 (was dominating PnL rewards)
+    fomo_penalty = -0.5  # v24: Match config/settings.py
     chop_penalty = -0.01  # Reduced from -0.1
     fomo_threshold_atr = 2.0  # Only trigger on significant moves
     chop_threshold = 80.0  # Only extreme chop triggers penalty
     reward_scaling = 0.01  # NAS100: 1 reward per 100 points
-    sl_atr_multiplier = 1.0
+    sl_atr_multiplier = 2.0  # v24: Tighter SL at 2x ATR
     tp_atr_multiplier = 3.0
     use_stop_loss = True
     use_take_profit = True
