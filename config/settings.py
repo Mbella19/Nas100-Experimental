@@ -226,9 +226,10 @@ class TradingConfig:
     # Reward Params (calibrated for NAS100)
     # NAS100 has ~100-200 point daily range vs EURUSD ~50-100 pip range
     # reward_scaling = 0.01 means 100 points = 1.0 reward (similar magnitude to EURUSD)
-    fomo_penalty: float = -0.5     # Moderate penalty for missing high-momentum moves
+    fomo_penalty: float = -0.05    # v25: Gentle penalty to prevent overtrading
     chop_penalty: float = 0.0     # Disabled (can cause over-penalization in legitimate ranging trades)
-    fomo_threshold_atr: float = 4.0  # Trigger on >4x ATR moves
+    fomo_threshold_atr: float = 4.0  # v25: Trigger on >4x ATR moves over lookback window
+    fomo_lookback_bars: int = 10     # v25: Check move over 10 bars
     chop_threshold: float = 80.0     # Only extreme chop triggers penalty
     reward_scaling: float = 0.01    # 1.0 reward per 100 points (NAS100 calibration)
 

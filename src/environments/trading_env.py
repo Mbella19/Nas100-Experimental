@@ -75,9 +75,10 @@ class TradingEnv(gym.Env):
         point_multiplier: float = 1.0, # Dollar per point per lot
         spread_pips: float = 3.5,     # NAS100 spread with buffer
         slippage_pips: float = 0.0,   # NAS100 slippage
-        fomo_penalty: float = -0.5,   # v24: Penalty for missing moves when Flat
+        fomo_penalty: float = -0.05,  # v25: Gentle penalty to prevent overtrading
         chop_penalty: float = 0.0,    # Disabled for stability
-        fomo_threshold_atr: float = 4.0,  # v15: Trigger on >1.5x ATR moves (was 2.0)
+        fomo_threshold_atr: float = 4.0,  # v25: Trigger on >4x ATR moves over lookback window
+        fomo_lookback_bars: int = 10,     # v25: Check move over 10 bars
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
         max_steps: int = 500,         # ~1 week for rapid regime cycling
         reward_scaling: float = 0.01,  # NAS100: 1.0 per 100 points (was 1.0 per pip for EURUSD)
@@ -186,6 +187,7 @@ class TradingEnv(gym.Env):
         self.fomo_penalty = fomo_penalty
         self.chop_penalty = chop_penalty
         self.fomo_threshold_atr = fomo_threshold_atr
+        self.fomo_lookback_bars = fomo_lookback_bars  # v25: Multi-bar FOMO check
         self.chop_threshold = chop_threshold
         self.max_steps = max_steps
         self.reward_scaling = reward_scaling  # Scale PnL to balance with penalties
@@ -1245,11 +1247,19 @@ class TradingEnv(gym.Env):
             # Position is flat - ensure tracking is reset
             self.prev_unrealized_pnl = 0.0
 
-        # FOMO penalty: flat during high momentum move
-        if self.position == 0:
-            if price_move > self.fomo_threshold_atr * atr:
-                reward += self.fomo_penalty
-                info['fomo_triggered'] = True
+        # FOMO penalty: flat during high momentum move (v25: multi-bar lookback)
+        if self.position == 0 and self.fomo_lookback_bars > 0:
+            # Check if price has moved significantly over the lookback window
+            lookback_start = max(0, self.current_idx - self.fomo_lookback_bars)
+            if lookback_start < self.current_idx:
+                price_at_lookback = self.close_prices[lookback_start]
+                current_price_fomo = self.close_prices[self.current_idx]
+                multi_bar_move = abs(current_price_fomo - price_at_lookback)
+                
+                if multi_bar_move > self.fomo_threshold_atr * atr:
+                    reward += self.fomo_penalty
+                    info['fomo_triggered'] = True
+                    info['fomo_move_pips'] = multi_bar_move
 
         # Chop penalty: holding position in ranging market
         if self.position != 0 and chop > self.chop_threshold:
@@ -1560,9 +1570,10 @@ def create_env_from_dataframes(
     # Extract config values (defaults for NAS100)
     pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
     spread_pips = 3.5  # NAS100 spread with buffer
-    fomo_penalty = -0.5  # v24: Match config/settings.py
+    fomo_penalty = -0.05  # v25: Gentle penalty to prevent overtrading
     chop_penalty = -0.01  # Reduced from -0.1
-    fomo_threshold_atr = 2.0  # Only trigger on significant moves
+    fomo_threshold_atr = 4.0  # v25: Trigger on >4x ATR moves
+    fomo_lookback_bars = 10   # v25: Check move over 10 bars
     chop_threshold = 80.0  # Only extreme chop triggers penalty
     reward_scaling = 0.01  # NAS100: 1 reward per 100 points
     sl_atr_multiplier = 2.0  # v24: Tighter SL at 2x ATR
@@ -1580,6 +1591,7 @@ def create_env_from_dataframes(
         fomo_penalty = getattr(config, 'fomo_penalty', fomo_penalty)
         chop_penalty = getattr(config, 'chop_penalty', chop_penalty)
         fomo_threshold_atr = getattr(config, 'fomo_threshold_atr', fomo_threshold_atr)
+        fomo_lookback_bars = getattr(config, 'fomo_lookback_bars', fomo_lookback_bars)
         chop_threshold = getattr(config, 'chop_threshold', chop_threshold)
         reward_scaling = getattr(config, 'reward_scaling', reward_scaling)
         sl_atr_multiplier = getattr(config, 'sl_atr_multiplier', sl_atr_multiplier)
@@ -1612,6 +1624,7 @@ def create_env_from_dataframes(
         fomo_penalty=fomo_penalty,
         chop_penalty=chop_penalty,
         fomo_threshold_atr=fomo_threshold_atr,
+        fomo_lookback_bars=fomo_lookback_bars,
         chop_threshold=chop_threshold,
         reward_scaling=reward_scaling,
         sl_atr_multiplier=sl_atr_multiplier,

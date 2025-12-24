@@ -609,9 +609,10 @@ def create_trading_env(
     # these defaults now produce correct reward signals
     spread_pips = 3.5       # NAS100 spread with buffer
     slippage_pips = 0.0     # Includes commission + slippage
-    fomo_penalty = -0.5   # v24: Match config/settings.py
+    fomo_penalty = -0.05  # v25: Gentle penalty to prevent overtrading
     chop_penalty = 0.0      # Disabled
-    fomo_threshold_atr = 4.0  # Trigger on >1.5x ATR moves
+    fomo_threshold_atr = 4.0  # v25: Trigger on >4x ATR moves over lookback window
+    fomo_lookback_bars = 10   # v25: Check move over 10 bars
     chop_threshold = 80.0   # Only extreme chop triggers penalty
     max_steps = 500
     reward_scaling = 0.01    # 1.0 reward per 1 pip (safe after fixing unit bugs)
@@ -655,6 +656,7 @@ def create_trading_env(
         fomo_penalty = getattr(trading_cfg, 'fomo_penalty', fomo_penalty)
         chop_penalty = getattr(trading_cfg, 'chop_penalty', chop_penalty)
         fomo_threshold_atr = getattr(trading_cfg, 'fomo_threshold_atr', fomo_threshold_atr)
+        fomo_lookback_bars = getattr(trading_cfg, 'fomo_lookback_bars', fomo_lookback_bars)
         chop_threshold = getattr(trading_cfg, 'chop_threshold', chop_threshold)
         max_steps = getattr(trading_cfg, 'max_steps_per_episode', max_steps)
         reward_scaling = getattr(trading_cfg, 'reward_scaling', reward_scaling)
@@ -710,6 +712,7 @@ def create_trading_env(
         fomo_penalty=fomo_penalty,
         chop_penalty=chop_penalty,
         fomo_threshold_atr=fomo_threshold_atr,
+        fomo_lookback_bars=fomo_lookback_bars,
         chop_threshold=chop_threshold,
         max_steps=max_steps,
         reward_scaling=reward_scaling,  # v15 FIX: Use local variable, not config directly
