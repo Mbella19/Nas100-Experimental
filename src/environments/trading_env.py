@@ -75,7 +75,7 @@ class TradingEnv(gym.Env):
         point_multiplier: float = 1.0, # Dollar per point per lot
         spread_pips: float = 3.5,     # NAS100 spread with buffer
         slippage_pips: float = 0.0,   # NAS100 slippage
-        fomo_penalty: float = -0.05,  # v25: Gentle penalty to prevent overtrading
+        fomo_penalty: float = -0.05,  # v25: Moderate FOMO penalty
         chop_penalty: float = 0.0,    # Disabled for stability
         fomo_threshold_atr: float = 4.0,  # v25: Trigger on >4x ATR moves over lookback window
         fomo_lookback_bars: int = 10,     # v25: Check move over 10 bars
@@ -83,6 +83,7 @@ class TradingEnv(gym.Env):
         max_steps: int = 500,         # ~1 week for rapid regime cycling
         reward_scaling: float = 0.01,  # NAS100: 1.0 per 100 points (was 1.0 per pip for EURUSD)
         trade_entry_bonus: float = 0.01,   # NAS100: offset spread cost
+        holding_bonus: float = 0.0,        # v25: DISABLED - was causing reward inflation
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
         market_feat_std: Optional[np.ndarray] = None,    # Pre-computed from training data
@@ -192,6 +193,7 @@ class TradingEnv(gym.Env):
         self.max_steps = max_steps
         self.reward_scaling = reward_scaling  # Scale PnL to balance with penalties
         self.trade_entry_bonus = trade_entry_bonus  # v15: Bonus for opening positions
+        self.holding_bonus = holding_bonus  # v25: Bonus for staying in profitable trades
 
         # Risk Management - Stop-Loss and Take-Profit
         self.sl_atr_multiplier = sl_atr_multiplier
@@ -1234,6 +1236,8 @@ class TradingEnv(gym.Env):
 
             # v24: Only add per-bar PnL if NOT using sparse rewards
             if not self.use_sparse_rewards:
+                # v25 FIX: Direct PnL reward - no tolerance buffer
+                # Reward = actual PnL change (no hiding losses)
                 reward += pnl_delta * self.reward_scaling
                 info['reward_type'] = 'continuous_pnl'
             else:
@@ -1243,6 +1247,16 @@ class TradingEnv(gym.Env):
             info['unrealized_pnl'] = current_unrealized_pnl
             info['pnl_delta'] = pnl_delta
             self.prev_unrealized_pnl = current_unrealized_pnl
+            
+            # v25: Holding bonus - reward for staying in GROWING profitable trades
+            # Only triggers if:
+            # 1. Profit > 0.5x ATR (prevents camping on tiny profits)
+            # 2. Profit is GROWING (pnl_delta > 0) (prevents camping when price stalls)
+            min_profit_for_bonus = atr * 0.5  # Minimum 0.5x ATR profit required
+            profit_is_growing = pnl_delta > 0
+            if current_unrealized_pnl > min_profit_for_bonus and profit_is_growing and self.holding_bonus > 0:
+                reward += self.holding_bonus
+                info['holding_bonus_applied'] = True
         else:
             # Position is flat - ensure tracking is reset
             self.prev_unrealized_pnl = 0.0
@@ -1570,12 +1584,13 @@ def create_env_from_dataframes(
     # Extract config values (defaults for NAS100)
     pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
     spread_pips = 3.5  # NAS100 spread with buffer
-    fomo_penalty = -0.05  # v25: Gentle penalty to prevent overtrading
+    fomo_penalty = -0.05  # v25: Moderate FOMO penalty
     chop_penalty = -0.01  # Reduced from -0.1
     fomo_threshold_atr = 4.0  # v25: Trigger on >4x ATR moves
     fomo_lookback_bars = 10   # v25: Check move over 10 bars
     chop_threshold = 80.0  # Only extreme chop triggers penalty
     reward_scaling = 0.01  # NAS100: 1 reward per 100 points
+    holding_bonus = 0.0    # v25: DISABLED - was causing reward inflation
     sl_atr_multiplier = 2.0  # v24: Tighter SL at 2x ATR
     tp_atr_multiplier = 3.0
     use_stop_loss = True
@@ -1594,6 +1609,7 @@ def create_env_from_dataframes(
         fomo_lookback_bars = getattr(config, 'fomo_lookback_bars', fomo_lookback_bars)
         chop_threshold = getattr(config, 'chop_threshold', chop_threshold)
         reward_scaling = getattr(config, 'reward_scaling', reward_scaling)
+        holding_bonus = getattr(config, 'holding_bonus', holding_bonus)
         sl_atr_multiplier = getattr(config, 'sl_atr_multiplier', sl_atr_multiplier)
         tp_atr_multiplier = getattr(config, 'tp_atr_multiplier', tp_atr_multiplier)
         use_stop_loss = getattr(config, 'use_stop_loss', use_stop_loss)
@@ -1627,6 +1643,7 @@ def create_env_from_dataframes(
         fomo_lookback_bars=fomo_lookback_bars,
         chop_threshold=chop_threshold,
         reward_scaling=reward_scaling,
+        holding_bonus=holding_bonus,
         sl_atr_multiplier=sl_atr_multiplier,
         tp_atr_multiplier=tp_atr_multiplier,
         use_stop_loss=use_stop_loss,

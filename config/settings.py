@@ -226,7 +226,7 @@ class TradingConfig:
     # Reward Params (calibrated for NAS100)
     # NAS100 has ~100-200 point daily range vs EURUSD ~50-100 pip range
     # reward_scaling = 0.01 means 100 points = 1.0 reward (similar magnitude to EURUSD)
-    fomo_penalty: float = -0.05    # v25: Gentle penalty to prevent overtrading
+    fomo_penalty: float = -0.05    # v25: Moderate FOMO penalty
     chop_penalty: float = 0.0     # Disabled (can cause over-penalization in legitimate ranging trades)
     fomo_threshold_atr: float = 4.0  # v25: Trigger on >4x ATR moves over lookback window
     fomo_lookback_bars: int = 10     # v25: Check move over 10 bars
@@ -236,6 +236,10 @@ class TradingConfig:
     # Trade entry bonus: Offsets entry cost to encourage exploration
     # NAS100 spread ~2.5 points × 0.01 = 0.025 reward cost, so bonus = 0.01
     trade_entry_bonus: float = 0.01  # v23.5: Reduced to offset ~40% of spread cost
+    
+    # v25: Position Holding Bonus - DISABLED to fix reward-PnL divergence
+    # Continuous PnL reward already incentivizes holding winners
+    holding_bonus: float = 0.0  # DISABLED - was causing reward inflation
     
     # v21: Progressive Rewards Mode (replaces v16 sparse mode)
     # Now using asymmetric rewards: reward profit increases, tolerate pullbacks

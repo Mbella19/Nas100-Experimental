@@ -609,7 +609,7 @@ def create_trading_env(
     # these defaults now produce correct reward signals
     spread_pips = 3.5       # NAS100 spread with buffer
     slippage_pips = 0.0     # Includes commission + slippage
-    fomo_penalty = -0.05  # v25: Gentle penalty to prevent overtrading
+    fomo_penalty = -0.05  # v25: Moderate FOMO penalty
     chop_penalty = 0.0      # Disabled
     fomo_threshold_atr = 4.0  # v25: Trigger on >4x ATR moves over lookback window
     fomo_lookback_bars = 10   # v25: Check move over 10 bars
@@ -618,6 +618,7 @@ def create_trading_env(
     reward_scaling = 0.01    # 1.0 reward per 1 pip (safe after fixing unit bugs)
     context_dim = 64
     trade_entry_bonus = 0.0  # Pure PnL-driven (no entry bonus)
+    holding_bonus = 0.0      # v25: DISABLED - was causing reward inflation
     noise_level = 0.01         # Default: no observation noise unless configured
 
     # Risk Management defaults
@@ -669,6 +670,8 @@ def create_trading_env(
         enforce_analyst_alignment = getattr(trading_cfg, 'enforce_analyst_alignment', enforce_analyst_alignment)
         # v15: Trade entry bonus
         trade_entry_bonus = getattr(trading_cfg, 'trade_entry_bonus', trade_entry_bonus)
+        # v25: Holding bonus
+        holding_bonus = getattr(trading_cfg, 'holding_bonus', holding_bonus)
         noise_level = getattr(trading_cfg, 'noise_level', noise_level)
         # v16: Sparse Rewards
         use_sparse_rewards = getattr(trading_cfg, 'use_sparse_rewards', use_sparse_rewards)
@@ -717,6 +720,7 @@ def create_trading_env(
         max_steps=max_steps,
         reward_scaling=reward_scaling,  # v15 FIX: Use local variable, not config directly
         trade_entry_bonus=trade_entry_bonus,  # v15: Exploration bonus
+        holding_bonus=holding_bonus,  # v25: Bonus for holding profitable trades
         device=device,
         noise_level=noise_level,
         market_feat_mean=market_feat_mean,
