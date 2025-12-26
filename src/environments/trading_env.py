@@ -75,7 +75,7 @@ class TradingEnv(gym.Env):
         point_multiplier: float = 1.0, # Dollar per point per lot
         spread_pips: float = 3.5,     # NAS100 spread with buffer
         slippage_pips: float = 0.0,   # NAS100 slippage
-        fomo_penalty: float = -0.05,  # v25: Moderate FOMO penalty
+        fomo_penalty: float = 0.0,  # v26: DEPRECATED - now using opportunity cost
         chop_penalty: float = 0.0,    # Disabled for stability
         fomo_threshold_atr: float = 4.0,  # v25: Trigger on >4x ATR moves over lookback window
         fomo_lookback_bars: int = 10,     # v25: Check move over 10 bars
@@ -108,7 +108,7 @@ class TradingEnv(gym.Env):
         # OHLC data for visualization (real candle data)
         ohlc_data: Optional[np.ndarray] = None,  # Shape: (n_samples, 4) with [open, high, low, close]
         timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
-        noise_level: float = 0.05,   # v26: Strong regularization for exploration
+        noise_level: float = 0.02,  # v26: Reduced noise
         # v16: Sparse Rewards Mode
         use_sparse_rewards: bool = False,  # v25: DISABLED - causes mode collapse
         # v17: Loss Tolerance Buffer
@@ -714,8 +714,9 @@ class TradingEnv(gym.Env):
             else:
                 returns_slice = self.returns[idx_start:idx_end]
             
-            # Multiply by 100 for normalization (returns are small floats)
-            obs = np.concatenate([obs, returns_slice * 100])
+            # v26 FIX: Returns are already normalized in parquet, no scaling needed
+            # Previous * 100 created [-500, 500] range, destroying PPO stability
+            obs = np.concatenate([obs, returns_slice])
 
         return obs.astype(np.float32)
 
@@ -784,9 +785,10 @@ class TradingEnv(gym.Env):
         # v20: BREAK-EVEN STOP LOSS
         # If profit reaches break_even_atr * ATR, move SL to entry price
         break_even_profit_pips = (atr * self.break_even_atr) / self.pip_value
-        current_unrealized = self._calculate_unrealized_pnl()
+        # v26 FIX: Divide by position_size so comparison is pips vs pips (not pip-lots vs pips)
+        current_unrealized_pips = self._calculate_unrealized_pnl() / max(self.position_size, 0.01)
         
-        if self.break_even_atr > 0 and current_unrealized >= break_even_profit_pips:
+        if self.break_even_atr > 0 and current_unrealized_pips >= break_even_profit_pips:
             if not self.break_even_activated:
                 self.break_even_activated = True  # Lock in break-even
             # Override SL to break-even (entry price = 0 pips loss)
@@ -1111,9 +1113,10 @@ class TradingEnv(gym.Env):
                         else:
                             current_atr = 20.0  # Fallback for NAS100
                         
-                        # Calculate unrealized profit in pips
-                        unrealized_pnl = self._calculate_unrealized_pnl()
-                        profit_threshold = self.early_exit_profit_atr * current_atr
+                        # Calculate unrealized profit in pips (divide by position_size!)
+                        # v26 FIX: _calculate_unrealized_pnl returns pips×lots, divide to get raw pips
+                        unrealized_pnl = self._calculate_unrealized_pnl() / max(self.position_size, 0.01)
+                        profit_threshold = self.early_exit_profit_atr * current_atr / self.pip_value
                         
                         if unrealized_pnl > profit_threshold:
                             allow_early_exit = True
@@ -1351,7 +1354,9 @@ class TradingEnv(gym.Env):
             # Position is flat - ensure tracking is reset
             self.prev_unrealized_pnl = 0.0
 
-        # FOMO penalty: flat during high momentum move (v25: multi-bar lookback)
+        # v26 FIX: FOMO as OPPORTUNITY COST (not fixed per-step penalty)
+        # Instead of -0.05 per step (which accumulates and causes bad trades),
+        # calculate the profit that was missed by not being in the move THIS bar
         if self.position == 0 and self.fomo_lookback_bars > 0:
             # Check if price has moved significantly over the lookback window
             lookback_start = max(0, self.current_idx - self.fomo_lookback_bars)
@@ -1361,9 +1366,20 @@ class TradingEnv(gym.Env):
                 multi_bar_move = abs(current_price_fomo - price_at_lookback)
                 
                 if multi_bar_move > self.fomo_threshold_atr * atr:
-                    reward += self.fomo_penalty
-                    info['fomo_triggered'] = True
-                    info['fomo_move_pips'] = multi_bar_move
+                    # Calculate opportunity cost: missed profit THIS bar only
+                    # (not the entire move, just the last step's price change)
+                    if self.current_idx > 0:
+                        prev_price = self.close_prices[self.current_idx - 1]
+                        this_bar_move = abs(current_price_fomo - prev_price)
+                        # Convert to pips and scale by reward_scaling
+                        missed_profit_pips = this_bar_move / self.pip_value
+                        # Apply as negative reward (opportunity cost)
+                        # Capped at 0.1 to prevent extreme penalties
+                        opportunity_cost = -min(missed_profit_pips * self.reward_scaling, 0.1)
+                        reward += opportunity_cost
+                        info['fomo_triggered'] = True
+                        info['fomo_move_pips'] = multi_bar_move
+                        info['fomo_opportunity_cost'] = opportunity_cost
 
         # Chop penalty: holding position in ranging market
         if self.position != 0 and chop > self.chop_threshold:
@@ -1505,12 +1521,13 @@ class TradingEnv(gym.Env):
             info['episode_end_forced_close_reward'] = forced_close_reward
             info['episode_end_forced_close_pnl'] = final_unrealized
 
-        # Get new observation (guard against out-of-bounds access at episode end)
-        if terminated or truncated:
-            # Return dummy observation - episode is over, this won't be used for training
-            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
-        else:
-            obs = self._get_observation()
+        # Get new observation (guarded for end-of-data)
+        # v26 FIX: Always return real observation, even at episode end
+        # SB3 needs final observation for value bootstrapping on truncated episodes
+        # Clamp index to valid range to avoid out-of-bounds
+        safe_idx = min(self.current_idx, len(self.close_prices) - 1)
+        self.current_idx = safe_idx  # Temporarily set safe index
+        obs = self._get_observation()  # Get real final state
 
         # Add episode info
         info['step'] = self.steps
@@ -1578,7 +1595,7 @@ def create_env_from_dataframes(
     feature_cols: Optional[list] = None,
     config: Optional[object] = None,
     device: Optional[torch.device] = None,
-    noise_level: float = 0.05  # v26: Strong regularization for exploration
+    noise_level = 0.02  # v26: Reduced noise
 ) -> TradingEnv:
     """
     Factory function to create TradingEnv from DataFrames.
@@ -1679,7 +1696,7 @@ def create_env_from_dataframes(
     # Extract config values (defaults for NAS100)
     pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
     spread_pips = 3.5  # NAS100 spread with buffer
-    fomo_penalty = -0.1  # v26: Increased FOMO penalty
+    fomo_penalty = 0.0  # v26: DEPRECATED - now using opportunity cost
     chop_penalty = -0.01  # Reduced from -0.1
     fomo_threshold_atr = 4.0  # v25: Trigger on >4x ATR moves
     fomo_lookback_bars = 10   # v25: Check move over 10 bars

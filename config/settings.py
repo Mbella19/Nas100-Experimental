@@ -226,7 +226,7 @@ class TradingConfig:
     # Reward Params (calibrated for NAS100)
     # NAS100 has ~100-200 point daily range vs EURUSD ~50-100 pip range
     # reward_scaling = 0.01 means 100 points = 1.0 reward (similar magnitude to EURUSD)
-    fomo_penalty: float = -0.05    # v25: Moderate FOMO penalty
+    fomo_penalty: float = 0.0    # v26: DEPRECATED - now using opportunity cost
     chop_penalty: float = 0.0     # Disabled (can cause over-penalization in legitimate ranging trades)
     fomo_threshold_atr: float = 4.0  # v25: Trigger on >4x ATR moves over lookback window
     fomo_lookback_bars: int = 10     # v25: Check move over 10 bars
@@ -275,7 +275,7 @@ class TradingConfig:
     initial_balance: float = 10000.0
     
     # Validation
-    noise_level: float = 0.05  # v26: Strong regularization for exploration
+    noise_level: float = 0.02  # v26: Reduced noise
 
     # NEW: "Full Eyes" Agent Features
     agent_lookback_window: int = 12   # Increased to 12 as requested (60 mins of 5m bars)

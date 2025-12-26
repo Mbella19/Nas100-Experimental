@@ -627,7 +627,7 @@ def create_trading_env(
     # these defaults now produce correct reward signals
     spread_pips = 3.5       # NAS100 spread with buffer
     slippage_pips = 0.0     # Includes commission + slippage
-    fomo_penalty = -0.05  # v25: Moderate FOMO penalty
+    fomo_penalty = 0.0  # v26: DEPRECATED - now using opportunity cost
     chop_penalty = 0.0      # Disabled
     fomo_threshold_atr = 4.0  # v25: Trigger on >4x ATR moves over lookback window
     fomo_lookback_bars = 10   # v25: Check move over 10 bars
@@ -637,7 +637,7 @@ def create_trading_env(
     context_dim = 64
     trade_entry_bonus = 0.0  # Pure PnL-driven (no entry bonus)
     holding_bonus = 0.0      # v25: DISABLED - was causing reward inflation
-    noise_level = 0.05         # v26: Strong regularization for exploration
+    noise_level = 0.02  # v26: Reduced noise
 
     # Risk Management defaults
     # v23.6: Updated to 1:2 R/R (was 2.0/12.0 = 1:6 inverted R/R)
