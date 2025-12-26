@@ -79,6 +79,7 @@ class AgentTrainingLogger(BaseCallback):
         self.episode_pnls: List[float] = []
         self.episode_trades: List[int] = []
         self.episode_win_rates: List[float] = []
+        self.episode_avg_trade_durations: List[float] = []  # v26: Track avg bars held per trade
         self.action_counts = {0: 0, 1: 0, 2: 0}  # Flat, Long, Short
         self.size_counts = {0: 0, 1: 0, 2: 0, 3: 0}  # Position sizes: 0.25, 0.5, 0.75, 1.0
         # Cumulative reward tracking (downsampled for long runs).
@@ -175,10 +176,16 @@ class AgentTrainingLogger(BaseCallback):
                 # Calculate win rate from trades if available
                 n_trades = info.get('n_trades', 0)
                 win_rate = 0.0
+                avg_duration = 0.0
                 if n_trades > 0 and 'trades' in info:
                     wins = sum(1 for t in info['trades'] if t.get('pnl', 0) > 0)
                     win_rate = wins / n_trades
+                    # v26: Calculate avg trade duration
+                    durations = [t.get('bars_held', 0) for t in info['trades'] if 'bars_held' in t]
+                    if durations:
+                        avg_duration = sum(durations) / len(durations)
                 self.episode_win_rates.append(win_rate)
+                self.episode_avg_trade_durations.append(avg_duration)
 
             # Log episode summary
             n_episodes = len(self.episode_rewards)
@@ -209,6 +216,9 @@ class AgentTrainingLogger(BaseCallback):
 
         if self.episode_win_rates:
             logger.info(f"  Win Rate: {self.episode_win_rates[-1]*100:.1f}%")
+
+        if self.episode_avg_trade_durations:
+            logger.info(f"  Avg Trade Duration: {self.episode_avg_trade_durations[-1]:.1f} bars")
 
     def _log_training_progress(self):
         """Log overall training progress."""
@@ -548,7 +558,8 @@ def prepare_env_data(
         ret = df_5m['close'].pct_change().fillna(0).values
         returns = ret[start_idx:start_idx + n_samples].astype(np.float32)
 
-    # Market features for reward shaping (includes S/R for breakout vs chase detection)
+    # Market features for observation (all 3 timeframes)
+    # v26: Agent now sees 5m, 15m, and 45m features for multi-timeframe context
     market_cols = [
         'atr', 'chop', 'adx', 'regime', 'sma_distance', 
         'dist_to_support', 'dist_to_resistance',
@@ -560,11 +571,18 @@ def prepare_env_data(
     available_cols = [c for c in market_cols if c in df_5m.columns]
 
     if len(available_cols) > 0:
-        market_features = df_5m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+        # v26: Extract from ALL 3 timeframes and concatenate
+        mkt_5m = df_5m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+        mkt_15m = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+        mkt_45m = df_45m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+        
+        # Concatenate: [5m_features, 15m_features, 45m_features]
+        market_features = np.concatenate([mkt_5m, mkt_15m, mkt_45m], axis=1).astype(np.float32)
+        logger.info(f"Multi-timeframe market features: {len(available_cols)} cols × 3 TFs = {market_features.shape[1]} total")
     else:
-        # Create dummy features if not available
-        market_features = np.zeros((n_samples, 5), dtype=np.float32)
-        market_features[:, 0] = 0.001  # Default ATR
+        # Create dummy features if not available (14 × 3 = 42)
+        market_features = np.zeros((n_samples, 42), dtype=np.float32)
+        market_features[:, 0] = 0.001  # Default ATR (5m)
         market_features[:, 1] = 50.0   # Default CHOP
         market_features[:, 2] = 20.0   # Default ADX
 
@@ -619,7 +637,7 @@ def create_trading_env(
     context_dim = 64
     trade_entry_bonus = 0.0  # Pure PnL-driven (no entry bonus)
     holding_bonus = 0.0      # v25: DISABLED - was causing reward inflation
-    noise_level = 0.01         # Default: no observation noise unless configured
+    noise_level = 0.05         # v26: Strong regularization for exploration
 
     # Risk Management defaults
     # v23.6: Updated to 1:2 R/R (was 2.0/12.0 = 1:6 inverted R/R)
@@ -643,7 +661,7 @@ def create_trading_env(
     # v17: Loss Tolerance Buffer
     loss_tolerance_atr = 0.5  # Allow 0.5x ATR drawdown before sparse mode kicks in
     # v18: Minimum Hold Time
-    min_hold_bars = 12  # Must hold for 12 bars (1h) before manual exit/flip allowed
+    min_hold_bars = 0  # v26: Disabled (use early_exit_penalty instead)
     # v19: Profit-based early exit override
     early_exit_profit_atr = 3.0  # Allow early exit if profit > 3x ATR
     # v20: Break-even stop loss

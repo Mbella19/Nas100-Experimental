@@ -82,7 +82,7 @@ class TradingEnv(gym.Env):
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
         max_steps: int = 500,         # ~1 week for rapid regime cycling
         reward_scaling: float = 0.01,  # NAS100: 1.0 per 100 points (was 1.0 per pip for EURUSD)
-        trade_entry_bonus: float = 0.01,   # NAS100: offset spread cost
+        trade_entry_bonus: float = 0.0,    # v25: DISABLED - pure PnL rewards only
         holding_bonus: float = 0.0,        # v25: DISABLED - was causing reward inflation
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
@@ -108,20 +108,23 @@ class TradingEnv(gym.Env):
         # OHLC data for visualization (real candle data)
         ohlc_data: Optional[np.ndarray] = None,  # Shape: (n_samples, 4) with [open, high, low, close]
         timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
-        noise_level: float = 0.001,  # Anti-overfitting noise (default enabled)
+        noise_level: float = 0.05,   # v26: Strong regularization for exploration
         # v16: Sparse Rewards Mode
         use_sparse_rewards: bool = False,  # v25: DISABLED - causes mode collapse
         # v17: Loss Tolerance Buffer
         loss_tolerance_atr: float = 0.5,  # Allow this much ATR drawdown before sparse mode kicks in
         # v18: Forced Minimum Hold Time
-        min_hold_bars: int = 12,  # Must hold for N bars before manual exit/flip is allowed
+        min_hold_bars: int = 0,  # v26: Disabled (use early_exit_penalty instead)
         early_exit_profit_atr: float = 3.0,  # Allow early exit if profit > this ATR multiple
         break_even_atr: float = 2.0,  # Move SL to break-even when profit reaches this ATR
+        # v26: Early Exit Penalty - discourages scalping
+        early_exit_penalty: float = 0.0,  # v26: Disabled
+        min_bars_before_exit: int = 10,    # Minimum bars before penalty-free exit
         # Full Eyes Features
         returns: Optional[np.ndarray] = None, # Recent 5m log-returns
         agent_lookback_window: int = 0, # How many return bars to see
         # Toggle Analyst usage (if False, agent uses only raw market features)
-        use_analyst: bool = True,
+        use_analyst: bool = False,  # v26: Default False - agent uses raw features only
     ):
         """
         Initialize the trading environment.
@@ -220,6 +223,9 @@ class TradingEnv(gym.Env):
         self.break_even_atr = break_even_atr  # v20: Move SL to break-even at this profit
         self.break_even_activated = False  # Track if break-even has been triggered
         self.entry_idx = 0  # Track when position was opened
+        # v26: Early Exit Penalty
+        self.early_exit_penalty = early_exit_penalty
+        self.min_bars_before_exit = min_bars_before_exit
 
         # Calculate valid range FIRST (needed for regime indices)
         # FIXED: If pre_windowed=True, data is already trimmed by prepare_env_data
@@ -283,9 +289,9 @@ class TradingEnv(gym.Env):
             analyst_metrics_dim = 0
             print("Analyst DISABLED - agent using raw market features only")
 
-        # Obs Dim = Context + Position(4) + Market + Analyst + SL/TP(2) + Returns
-        # v25: Position now has 4 elements: [position, entry_price_norm, unrealized_pnl_norm, time_in_trade_norm]
-        obs_dim = effective_context_dim + 4 + n_market_features + analyst_metrics_dim + 2 + self.agent_lookback_window
+        # Obs Dim = Context + Position(4) + Market + Analyst + SL/TP(2) + Hold(4) + Returns
+        # v26: Added 4 hold features: profit_progress, dist_to_tp_pct, momentum_aligned, session_progress
+        obs_dim = effective_context_dim + 4 + n_market_features + analyst_metrics_dim + 2 + 4 + self.agent_lookback_window
 
         # Store effective dimensions for _get_observation
         self.effective_context_dim = effective_context_dim
@@ -629,15 +635,71 @@ class TradingEnv(gym.Env):
                     dist_sl_norm = (sl_price - current_price) / atr
                     dist_tp_norm = (current_price - tp_price) / atr
 
+        # v26: Hold-Encouraging Features
+        profit_progress = 0.0  # 0 = at entry, 1 = at TP
+        dist_to_tp_pct = 1.0   # 1 = at entry, 0 = at TP  
+        momentum_aligned = 0.0  # Positive = price moving in trade direction
+        session_progress = 0.0  # 0-1 based on hour of day
+
+        if self.position != 0 and len(self.market_features.shape) > 1:
+            atr = self.market_features[self.current_idx, 0]
+            if atr > 1e-8:
+                tp_target = self.tp_atr_multiplier * atr
+                
+                # Profit Progress: How far toward TP (0 = entry, 1 = at TP)
+                unrealized = self._calculate_unrealized_pnl() * self.pip_value  # Convert to price units
+                profit_progress = np.clip(unrealized / tp_target, -1.0, 1.0)
+                
+                # Distance to TP as percentage (1 = at entry, 0 = at TP)
+                dist_to_tp_pct = np.clip(1.0 - profit_progress, 0.0, 2.0)
+                
+                # Momentum Aligned: Is recent price movement in trade direction?
+                if self.current_idx >= 5:
+                    price_5_bars_ago = self.close_prices[self.current_idx - 5]
+                    price_change = (current_price - price_5_bars_ago) / atr
+                    momentum_aligned = price_change * self.position  # Positive = good for trade
+                    momentum_aligned = np.clip(momentum_aligned, -2.0, 2.0)
+
+        # Session Progress: Normalized hour of day (0 = midnight, 0.5 = noon)
+        # Use timestamps if available, else use step % 288 (5m bars in a day)
+        if self.timestamps is not None and self.current_idx < len(self.timestamps):
+            ts = self.timestamps[self.current_idx]
+            hour = (ts % 86400) // 3600  # Seconds since midnight -> hour
+            session_progress = hour / 24.0
+        else:
+            session_progress = (self.current_idx % 288) / 288.0
+
+        # Hold features array
+        # v26: Add noise to momentum_aligned only (derived from price, benefits from regularization)
+        if self.noise_level > 0:
+            momentum_aligned_noisy = momentum_aligned + np.random.normal(0, self.noise_level)
+        else:
+            momentum_aligned_noisy = momentum_aligned
+            
+        hold_features = np.array([
+            profit_progress,         # No noise - exact TP progress
+            dist_to_tp_pct,          # No noise - exact distance
+            momentum_aligned_noisy,  # With noise - regularized market signal
+            session_progress         # No noise - exact time
+        ], dtype=np.float32)
+
+        # v26: Apply noise ONLY to market features (not position state, SL/TP, hold features)
+        # This preserves exact state information while regularizing market signals
+        if self.noise_level > 0:
+            market_feat_noisy = market_feat + np.random.normal(0, self.noise_level, size=market_feat.shape).astype(np.float32)
+        else:
+            market_feat_noisy = market_feat
+
         obs = np.concatenate([
             context,
-            position_state,
-            market_feat,
+            position_state,           # No noise - exact position info
+            market_feat_noisy,        # With noise - regularized market signals
             analyst_metrics,
-            np.array([dist_sl_norm, dist_tp_norm], dtype=np.float32)
+            np.array([dist_sl_norm, dist_tp_norm], dtype=np.float32),  # No noise - exact SL/TP
+            hold_features             # No noise - exact hold state
         ])
         
-        # Append "Full Eyes" features
+        # Append "Full Eyes" features (no noise - exact returns)
         if self.agent_lookback_window > 0 and self.returns is not None:
             # Slice recent returns
             # Use current_idx + 1 because the 'returns' array aligns with close_prices
@@ -654,11 +716,6 @@ class TradingEnv(gym.Env):
             
             # Multiply by 100 for normalization (returns are small floats)
             obs = np.concatenate([obs, returns_slice * 100])
-                
-        # Anti-Overfitting: Inject Gaussian Noise
-        if self.noise_level > 0:
-            noise = np.random.normal(0, self.noise_level, size=obs.shape).astype(np.float32)
-            obs += noise
 
         return obs.astype(np.float32)
 
@@ -757,6 +814,8 @@ class TradingEnv(gym.Env):
                     'direction': self.position,
                     'size': self.position_size,
                     'pnl': pnl,
+
+                    'bars_held': self.current_idx - self.entry_idx,
                     'close_reason': 'stop_loss'
                 })
 
@@ -799,6 +858,8 @@ class TradingEnv(gym.Env):
                     'direction': self.position,
                     'size': self.position_size,
                     'pnl': pnl,
+
+                    'bars_held': self.current_idx - self.entry_idx,
                     'close_reason': 'take_profit'
                 })
 
@@ -844,6 +905,8 @@ class TradingEnv(gym.Env):
                     'direction': self.position,
                     'size': self.position_size,
                     'pnl': pnl,
+
+                    'bars_held': self.current_idx - self.entry_idx,
                     'close_reason': 'stop_loss'
                 })
 
@@ -884,6 +947,8 @@ class TradingEnv(gym.Env):
                     'direction': self.position,
                     'size': self.position_size,
                     'pnl': pnl,
+
+                    'bars_held': self.current_idx - self.entry_idx,
                     'close_reason': 'take_profit'
                 })
 
@@ -1084,6 +1149,13 @@ class TradingEnv(gym.Env):
                 # small trades to collect bonuses regardless of actual profitability.
                 # PnL delta (above) is now the ONLY source of reward for exits.
 
+                # v26: Early Exit Penalty - penalize premature closes to discourage scalping
+                bars_held = self.current_idx - self.entry_idx
+                if bars_held < self.min_bars_before_exit and self.early_exit_penalty != 0:
+                    reward += self.early_exit_penalty
+                    info['early_exit_penalty'] = self.early_exit_penalty
+                    info['bars_held_at_exit'] = bars_held
+
                 # Record trade statistics
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized  # Unscaled for tracking
@@ -1094,7 +1166,9 @@ class TradingEnv(gym.Env):
                     'exit': current_price,
                     'direction': self.position,
                     'size': self.position_size,
-                    'pnl': final_unrealized
+                    'pnl': final_unrealized,
+
+                    'bars_held': self.current_idx - self.entry_idx
                 })
 
                 # NOW reset position state
@@ -1121,6 +1195,12 @@ class TradingEnv(gym.Env):
 
                 # REMOVED: Direction bonus (see comment in Flat/Exit case above)
 
+                # v26: Early Exit Penalty - penalize premature flips
+                bars_held = self.current_idx - self.entry_idx
+                if bars_held < self.min_bars_before_exit and self.early_exit_penalty != 0:
+                    reward += self.early_exit_penalty
+                    info['early_exit_penalty'] = self.early_exit_penalty
+
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized
                 info['pnl_delta'] = final_delta
@@ -1130,7 +1210,9 @@ class TradingEnv(gym.Env):
                     'exit': current_price,
                     'direction': -1,
                     'size': self.position_size,
-                    'pnl': final_unrealized
+                    'pnl': final_unrealized,
+
+                    'bars_held': self.current_idx - self.entry_idx
                 })
 
                 # NOW reset position state before opening new one
@@ -1178,6 +1260,12 @@ class TradingEnv(gym.Env):
 
                 # REMOVED: Direction bonus (see comment in Flat/Exit case above)
 
+                # v26: Early Exit Penalty - penalize premature flips
+                bars_held = self.current_idx - self.entry_idx
+                if bars_held < self.min_bars_before_exit and self.early_exit_penalty != 0:
+                    reward += self.early_exit_penalty
+                    info['early_exit_penalty'] = self.early_exit_penalty
+
                 info['trade_closed'] = True
                 info['pnl'] = final_unrealized
                 info['pnl_delta'] = final_delta
@@ -1187,7 +1275,9 @@ class TradingEnv(gym.Env):
                     'exit': current_price,
                     'direction': 1,
                     'size': self.position_size,
-                    'pnl': final_unrealized
+                    'pnl': final_unrealized,
+
+                    'bars_held': self.current_idx - self.entry_idx
                 })
 
                 # NOW reset position state before opening new one
@@ -1357,6 +1447,10 @@ class TradingEnv(gym.Env):
         reward = sl_tp_reward + action_reward
         info = {**action_info, **sl_tp_info}  # SL/TP info takes precedence
 
+        # Store bars_held BEFORE index increment (for episode-end forced close)
+        # This fixes the off-by-one bug where bars_held was calculated after increment
+        bars_held_before_increment = self.current_idx - self.entry_idx if self.position != 0 else 0
+
         # Move to next step
         self.current_idx += 1
         self.steps += 1
@@ -1395,6 +1489,7 @@ class TradingEnv(gym.Env):
                 'direction': self.position,
                 'size': self.position_size,
                 'pnl': final_unrealized,
+                'bars_held': bars_held_before_increment,  # FIX: Use pre-increment value
                 'close_reason': 'episode_end'
             })
 
@@ -1483,7 +1578,7 @@ def create_env_from_dataframes(
     feature_cols: Optional[list] = None,
     config: Optional[object] = None,
     device: Optional[torch.device] = None,
-    noise_level: float = 0.001
+    noise_level: float = 0.05  # v26: Strong regularization for exploration
 ) -> TradingEnv:
     """
     Factory function to create TradingEnv from DataFrames.
@@ -1584,7 +1679,7 @@ def create_env_from_dataframes(
     # Extract config values (defaults for NAS100)
     pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
     spread_pips = 3.5  # NAS100 spread with buffer
-    fomo_penalty = -0.05  # v25: Moderate FOMO penalty
+    fomo_penalty = -0.1  # v26: Increased FOMO penalty
     chop_penalty = -0.01  # Reduced from -0.1
     fomo_threshold_atr = 4.0  # v25: Trigger on >4x ATR moves
     fomo_lookback_bars = 10   # v25: Check move over 10 bars
@@ -1599,6 +1694,9 @@ def create_env_from_dataframes(
     risk_per_trade = 100.0  # Dollar risk per trade
     enforce_analyst_alignment = False  # DISABLED: Soft masking breaks PPO gradients
     num_classes = 2
+    # v26: Early Exit Penalty defaults
+    early_exit_penalty = -0.1
+    min_bars_before_exit = 10
 
     if config is not None:
         pip_value = getattr(config, 'pip_value', pip_value)
@@ -1618,6 +1716,9 @@ def create_env_from_dataframes(
         risk_per_trade = getattr(config, 'risk_per_trade', risk_per_trade)
         enforce_analyst_alignment = getattr(config, 'enforce_analyst_alignment', enforce_analyst_alignment)
         noise_level = getattr(config, 'noise_level', noise_level)
+        # v26: Early Exit Penalty
+        early_exit_penalty = getattr(config, 'early_exit_penalty', -0.1)
+        min_bars_before_exit = getattr(config, 'min_bars_before_exit', 10)
 
     if analyst_model is not None:
         num_classes = getattr(analyst_model, 'num_classes', 2)
@@ -1655,5 +1756,8 @@ def create_env_from_dataframes(
         # Visualization data
         ohlc_data=ohlc_data,
         timestamps=timestamps,
-        noise_level=noise_level
+        noise_level=noise_level,
+        # v26: Early Exit Penalty
+        early_exit_penalty=early_exit_penalty,
+        min_bars_before_exit=min_bars_before_exit
     )

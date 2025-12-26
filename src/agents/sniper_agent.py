@@ -53,25 +53,25 @@ def linear_schedule(initial_value: float, final_value: float = None) -> Callable
 
 class EntropyScheduleCallback(BaseCallback):
     """
-    Callback with 4-phase stepped entropy for 1B timestep training.
+    Callback with 4-phase stepped entropy for training.
 
-    v24: More aggressive decay - faster convergence to confident policies.
+    v26: Extended phases for longer exploration.
 
-    Phase 1 (0-50M):      ent_coef = 0.05  (explore - but not too random)
-    Phase 2 (50M-150M):   ent_coef = 0.02  (transition)
-    Phase 3 (150M-300M):  ent_coef = 0.01  (exploit)
-    Phase 4 (300M+):      ent_coef = 0.005 (confident policies)
+    Phase 1 (0-200M):      ent_coef = 0.05  (explore - aggressive)
+    Phase 2 (200M-300M):   ent_coef = 0.02  (transition)
+    Phase 3 (300M-600M):   ent_coef = 0.01  (exploit)
+    Phase 4 (600M+):       ent_coef = 0.005 (confident policies)
     """
 
     def __init__(
         self,
-        phase1_steps: int = 50_000_000,   # Only 50M at higher explore (was 200M)
-        phase2_steps: int = 100_000_000,  # Next 100M (50M-150M): transition
-        phase3_steps: int = 150_000_000,  # Next 150M (150M-300M): exploit
-        phase1_ent: float = 0.05,         # Start lower (was 0.10) - less random
+        phase1_steps: int = 200_000_000,  # v26: 0-200M (explore)
+        phase2_steps: int = 100_000_000,  # v26: 200M-300M (transition)
+        phase3_steps: int = 300_000_000,  # v26: 300M-600M (exploit)
+        phase1_ent: float = 0.05,         # High entropy for exploration
         phase2_ent: float = 0.02,         # Transition entropy
         phase3_ent: float = 0.01,         # Exploit entropy
-        phase4_ent: float = 0.005,        # Allow confident policies (was 0.01)
+        phase4_ent: float = 0.005,        # Confident policies
         verbose: int = 0
     ):
         super().__init__(verbose)
@@ -208,7 +208,7 @@ class SniperAgent:
         device: Optional[str | torch.device] = None,
         verbose: int = 1,
         seed: Optional[int] = None,
-        use_lr_schedule: bool = True  # NEW: Enable linear LR decay
+        use_lr_schedule: bool = False  # v26: DISABLED - constant LR for aggressive learning
     ):
         """
         Initialize the Sniper Agent.
@@ -234,11 +234,18 @@ class SniperAgent:
         self.verbose = verbose
 
         # Network architecture
+        # v25: Asymmetric architecture - Critic larger than Actor
+        # Value estimation (continuous scalar) is harder than action selection (3 choices)
+        # Larger Critic should improve Explained Variance (was ~0.20, target >0.5)
         if net_arch is None:
-            net_arch = [256, 256]
+            net_arch = [256, 256]  # Default Actor size
 
+        # Asymmetric: Actor [256,256], Critic [512,512,256]
         policy_kwargs = {
-            'net_arch': dict(pi=net_arch, vf=net_arch)
+            'net_arch': dict(
+                pi=net_arch,              # Actor: 2 layers of 256
+                vf=[512, 512, 256]        # Critic: 3 layers, wider
+            )
         }
 
         # Device selection with fallback

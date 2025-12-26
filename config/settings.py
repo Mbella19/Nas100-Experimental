@@ -131,7 +131,7 @@ class AnalystConfig:
     tcn_kernel_size: int = 3    # Convolution kernel size
 
     batch_size: int = 128       # Keep at 128
-    learning_rate: float = 1e-4 # REDUCED from 3e-4 - more stable convergence
+    learning_rate: float = 3e-4 # v26: Increased for faster learning, no decay
     weight_decay: float = 1e-4  # FIXED: Was 1e-2 (100x too high!) - standard value
     max_epochs: int = 100
     patience: int = 20  # Increased from 15 - more time to find recall balance
@@ -235,11 +235,15 @@ class TradingConfig:
 
     # Trade entry bonus: Offsets entry cost to encourage exploration
     # NAS100 spread ~2.5 points × 0.01 = 0.025 reward cost, so bonus = 0.01
-    trade_entry_bonus: float = 0.01  # v23.5: Reduced to offset ~40% of spread cost
+    trade_entry_bonus: float = 0.0   # v25: DISABLED - pure PnL rewards only
     
     # v25: Position Holding Bonus - DISABLED to fix reward-PnL divergence
     # Continuous PnL reward already incentivizes holding winners
     holding_bonus: float = 0.0  # DISABLED - was causing reward inflation
+    
+    # v26: Early Exit Penalty - discourages scalping by penalizing premature exits
+    early_exit_penalty: float = 0.0  # v26: Disabled
+    min_bars_before_exit: int = 10    # Minimum bars before exit is allowed without penalty
     
     # v21: Progressive Rewards Mode (replaces v16 sparse mode)
     # Now using asymmetric rewards: reward profit increases, tolerate pullbacks
@@ -271,7 +275,7 @@ class TradingConfig:
     initial_balance: float = 10000.0
     
     # Validation
-    noise_level: float = 0.01  # Reduced to 2% to encourage more activity (was 5%)
+    noise_level: float = 0.05  # v26: Strong regularization for exploration
 
     # NEW: "Full Eyes" Agent Features
     agent_lookback_window: int = 12   # Increased to 12 as requested (60 mins of 5m bars)
@@ -311,12 +315,12 @@ class AgentConfig:
     # PPO hyperparameters (v23: Fixed for continuous PnL rewards)
     # Previous config had broken minibatch ratio (8192/1024=8 minibatches) which
     # caused gradient noise with sparse rewards. Now using standard PPO setup.
-    learning_rate: float = 1e-4  # v23: Reduced from 2e-4 for stability
+    learning_rate: float = 3e-4  # v26: Increased for faster learning
     n_steps: int = 2048         # v23: Faster feedback (was 8192)
     batch_size: int = 256       # v23: 2048/256 = 8 minibatches (was 1024)
     n_epochs: int = 4           # v23: Reduced from 10 to prevent overfitting
     # v23: Standard discount factor for trading (trade-level rewards, not episode-end)
-    gamma: float = 0.995  # v25: Higher gamma encourages longer holds (was 0.95)
+    gamma: float = 0.995  # v25: Standard gamma for trading
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     ent_coef: float = 0.05        # Initial value (decays to 0.001 via EntropyScheduleCallback)
