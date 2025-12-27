@@ -235,7 +235,7 @@ class TradingConfig:
 
     # Trade entry bonus: Offsets entry cost to encourage exploration
     # NAS100 spread ~2.5 points × 0.01 = 0.025 reward cost, so bonus = 0.01
-    trade_entry_bonus: float = 0.1   # v26: Moderate incentive to enter trades
+    trade_entry_bonus: float = 0.05   # v27: Minimal incentive to enter trades
     
     # v25: Position Holding Bonus - DISABLED to fix reward-PnL divergence
     # Continuous PnL reward already incentivizes holding winners
@@ -323,7 +323,7 @@ class AgentConfig:
     gamma: float = 0.99  # v26: Reduced for better EV learning
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.1        # v27: High exploration for risk-taking
+    ent_coef: float = 0.05        # v27: Moderate exploration
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 

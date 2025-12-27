@@ -49,7 +49,7 @@ logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class MarketFeatureStats:
-    """Z-score stats applied to `market_features` inside the observation."""
+    """Z-score stats applied to `market_features` inside the observation (FALLBACK only)."""
 
     cols: Tuple[str, ...]
     mean: np.ndarray
@@ -64,6 +64,95 @@ class MarketFeatureStats:
         std = data["std"].astype(np.float32)
         std = np.where(std > 1e-8, std, 1.0).astype(np.float32)
         return cls(cols=cols, mean=mean, std=std)
+
+
+class RollingMarketNormalizer:
+    """
+    O(1) rolling window normalizer for market features.
+    
+    Uses circular buffer + running sums to compute rolling mean/std,
+    exactly matching TradingEnv's implementation for training parity.
+    """
+    
+    ROLLING_WINDOW_SIZE = 5760  # 20 days of 5m bars (matches TradingEnv)
+    ROLLING_MIN_SAMPLES = 100   # Minimum samples before using rolling stats
+    
+    def __init__(self, n_features: int, fallback_stats: MarketFeatureStats):
+        self.n_features = n_features
+        self.fallback_stats = fallback_stats
+        
+        # Circular buffer for O(1) updates
+        self.buffer = np.zeros((self.ROLLING_WINDOW_SIZE, n_features), dtype=np.float32)
+        self.idx = 0  # Current write position
+        self.count = 0  # Samples added (up to ROLLING_WINDOW_SIZE)
+        
+        # Running sums for O(1) mean/std calculation
+        self.rolling_sum = np.zeros(n_features, dtype=np.float64)
+        self.rolling_sum_sq = np.zeros(n_features, dtype=np.float64)
+    
+    def update_and_normalize(self, market_feat_row: np.ndarray) -> np.ndarray:
+        """
+        Update rolling buffer with new row and return normalized features.
+        Uses rolling stats if enough samples, otherwise falls back to global stats.
+        """
+        market_feat_row = market_feat_row.astype(np.float32)
+        
+        # Always update the rolling buffer
+        if self.count >= self.ROLLING_WINDOW_SIZE:
+            # Evict oldest value from running sums
+            old_val = self.buffer[self.idx]
+            self.rolling_sum -= old_val
+            self.rolling_sum_sq -= old_val ** 2
+        
+        # Add new value
+        self.buffer[self.idx] = market_feat_row
+        self.rolling_sum += market_feat_row
+        self.rolling_sum_sq += market_feat_row ** 2
+        
+        # Update circular index
+        self.idx = (self.idx + 1) % self.ROLLING_WINDOW_SIZE
+        if self.count < self.ROLLING_WINDOW_SIZE:
+            self.count += 1
+        
+        # Calculate normalized features
+        if self.count >= self.ROLLING_MIN_SAMPLES:
+            # O(1) rolling mean/std calculation
+            n = self.count
+            rolling_means = (self.rolling_sum / n).astype(np.float32)
+            variance = (self.rolling_sum_sq / n) - (rolling_means ** 2)
+            rolling_stds = np.maximum(np.sqrt(np.maximum(variance, 0)), 1e-6).astype(np.float32)
+            
+            normalized = ((market_feat_row - rolling_means) / rolling_stds).astype(np.float32)
+        else:
+            # Fallback to global stats until we have enough samples
+            normalized = ((market_feat_row - self.fallback_stats.mean) / 
+                         self.fallback_stats.std).astype(np.float32)
+        
+        # Safety clip to ±5.0 (matches TradingEnv)
+        return np.clip(normalized, -5.0, 5.0)
+    
+    def warmup(self, historical_rows: np.ndarray) -> None:
+        """
+        Pre-fill the rolling buffer with historical data.
+        Call this at startup with the last N market feature rows.
+        """
+        if historical_rows is None or len(historical_rows) == 0:
+            return
+        
+        # Take last ROLLING_WINDOW_SIZE rows
+        warmup_data = historical_rows[-self.ROLLING_WINDOW_SIZE:].astype(np.float32)
+        n_warmup = len(warmup_data)
+        
+        # Fill buffer
+        self.buffer[:n_warmup] = warmup_data
+        self.idx = n_warmup % self.ROLLING_WINDOW_SIZE
+        self.count = n_warmup
+        
+        # Compute running sums
+        self.rolling_sum = warmup_data.sum(axis=0).astype(np.float64)
+        self.rolling_sum_sq = (warmup_data ** 2).sum(axis=0).astype(np.float64)
+        
+        logger.info(f"Rolling normalizer warmed up with {n_warmup} samples")
 
 
 @dataclass
@@ -195,7 +284,7 @@ def _build_observation(
     *,
     analyst: torch.nn.Module,
     agent_env_cfg: Config,
-    market_feat_stats: MarketFeatureStats,
+    rolling_normalizer: RollingMarketNormalizer,  # v27: Use rolling normalizer for training parity
     x_5m: np.ndarray,
     x_15m: np.ndarray,
     x_45m: np.ndarray,
@@ -270,14 +359,9 @@ def _build_observation(
     # v25: Position state now has 4 elements (matching TradingEnv)
     position_state = np.array([float(position), entry_price_norm, unrealized_pnl_norm, time_in_trade_norm], dtype=np.float32)
 
-    # Market feature normalization (second-stage zscore used in env)
-    # Ensure the incoming row ordering matches the saved stats ordering.
-    if tuple(MARKET_FEATURE_COLS) != tuple(market_feat_stats.cols):
-        raise ValueError(
-            "Market feature columns mismatch. "
-            f"Expected {market_feat_stats.cols}, got {MARKET_FEATURE_COLS}"
-        )
-    market_feat_norm = ((market_feat_row - market_feat_stats.mean) / market_feat_stats.std).astype(np.float32)
+    # v27: Use rolling window normalization for training parity
+    # No need to check column ordering - rolling_normalizer handles this
+    market_feat_norm = rolling_normalizer.update_and_normalize(market_feat_row)
 
     # SL/TP distance features (mirrors TradingEnv)
     dist_sl_norm = 0.0
@@ -343,6 +427,12 @@ class MT5BridgeState:
 
         market_stats_path = system_cfg.paths.models_agent / "market_feat_stats.npz"
         self.market_feat_stats = MarketFeatureStats.load(market_stats_path)
+        
+        # v27: Rolling window normalizer for market features (matches TradingEnv)
+        self.rolling_normalizer = RollingMarketNormalizer(
+            n_features=len(MARKET_FEATURE_COLS),
+            fallback_stats=self.market_feat_stats
+        )
 
         feature_dims = {k: len(MODEL_FEATURE_COLS) for k in ("5m", "15m", "45m")}
         analyst_path = system_cfg.paths.models_analyst / "best.pt"
@@ -600,7 +690,7 @@ class MT5BridgeState:
         obs, obs_info = _build_observation(
             analyst=self.analyst,
             agent_env_cfg=self.system_cfg,
-            market_feat_stats=self.market_feat_stats,
+            rolling_normalizer=self.rolling_normalizer,  # v27: Use rolling normalizer
             x_5m=x_5m,
             x_15m=x_15m,
             x_45m=x_45m,

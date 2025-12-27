@@ -48,4 +48,4 @@ MARKET_FEATURE_COLS: list[str] = [
 ]
 
 # TradingEnv size mapping (must match TradingEnv.POSITION_SIZES)
-POSITION_SIZES: tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
+POSITION_SIZES: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0)

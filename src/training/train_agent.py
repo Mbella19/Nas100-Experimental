@@ -579,14 +579,24 @@ def prepare_env_data(
         # Concatenate: [5m_features, 15m_features, 45m_features]
         market_features = np.concatenate([mkt_5m, mkt_15m, mkt_45m], axis=1).astype(np.float32)
         logger.info(f"Multi-timeframe market features: {len(available_cols)} cols × 3 TFs = {market_features.shape[1]} total")
+        
+        # v27: Extract rolling lookback data (data BEFORE start_idx for warmup)
+        rolling_window_size = 5760  # 20 days of 5m bars
+        lookback_start = max(0, start_idx - rolling_window_size)
+        lookback_5m = df_5m[available_cols].values[lookback_start:start_idx].astype(np.float32)
+        lookback_15m = df_15m[available_cols].values[lookback_start:start_idx].astype(np.float32)
+        lookback_45m = df_45m[available_cols].values[lookback_start:start_idx].astype(np.float32)
+        rolling_lookback_data = np.concatenate([lookback_5m, lookback_15m, lookback_45m], axis=1).astype(np.float32)
+        logger.info(f"Rolling lookback data: {len(rolling_lookback_data)} bars before start_idx")
     else:
         # Create dummy features if not available (14 × 3 = 42)
         market_features = np.zeros((n_samples, 42), dtype=np.float32)
         market_features[:, 0] = 0.001  # Default ATR (5m)
         market_features[:, 1] = 50.0   # Default CHOP
         market_features[:, 2] = 20.0   # Default ADX
+        rolling_lookback_data = None
 
-    return data_5m, data_15m, data_45m, close_prices, market_features, returns
+    return data_5m, data_15m, data_45m, close_prices, market_features, returns, rolling_lookback_data
 
 
 def create_trading_env(
@@ -607,6 +617,7 @@ def create_trading_env(
     timestamps: Optional[np.ndarray] = None,        # Real timestamps for visualization
     returns: Optional[np.ndarray] = None,           # Returns for Full Eyes
     use_analyst: bool = True,                       # Toggle analyst usage
+    rolling_lookback_data: Optional[np.ndarray] = None,  # v27: Rolling window warmup data
 ) -> TradingEnv:
     """
     Create the trading environment.
@@ -635,7 +646,7 @@ def create_trading_env(
     max_steps = 500
     reward_scaling = 0.01    # 1.0 reward per 1 pip (safe after fixing unit bugs)
     context_dim = 64
-    trade_entry_bonus = 0.1  # v26: Moderate incentive to enter trades
+    trade_entry_bonus = 0.05  # v27: Minimal incentive to enter trades
     holding_bonus = 0.0      # v25: DISABLED - was causing reward inflation
     noise_level = 0.05  # v27: Moderate regularization noise
 
@@ -778,6 +789,8 @@ def create_trading_env(
         agent_lookback_window=getattr(trading_cfg, 'agent_lookback_window', 6) if config is not None else 6,
         # Toggle Analyst usage
         use_analyst=use_analyst,
+        # v27: Rolling window warmup data
+        rolling_lookback_data=rolling_lookback_data,
     )
 
     return env
@@ -903,7 +916,7 @@ def train_agent(
     lookback_15m = config.analyst.lookback_15m
     lookback_45m = config.analyst.lookback_45m
 
-    data_15m, data_1h, data_4h, close_prices, market_features, returns = prepare_env_data(
+    data_15m, data_1h, data_4h, close_prices, market_features, returns, rolling_lookback_data = prepare_env_data(
         df_15m, df_1h, df_4h, feature_cols,
         lookback_5m, lookback_15m, lookback_45m,
     )
@@ -1265,7 +1278,7 @@ def load_and_evaluate(
     analyst = load_analyst(analyst_path, feature_dims, device, freeze=True)
 
     # Prepare data (use last portion as test)
-    data_15m, data_1h, data_4h, close_prices, market_features, returns = prepare_env_data(
+    data_15m, data_1h, data_4h, close_prices, market_features, returns, rolling_lookback_data = prepare_env_data(
         df_15m, df_1h, df_4h, feature_cols
     )
 

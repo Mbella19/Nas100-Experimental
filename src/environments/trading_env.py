@@ -17,6 +17,7 @@ import torch
 from typing import Dict, Tuple, Optional, Any
 import pandas as pd
 import gc
+from collections import deque  # v27: For rolling window normalization
 
 
 class TradingEnv(gym.Env):
@@ -44,7 +45,7 @@ class TradingEnv(gym.Env):
     metadata = {'render_modes': ['human']}
 
     # Position sizing multipliers
-    POSITION_SIZES = (1.25, 2.5, 3.75, 5.0)  # v27: 5x original for aggressive risk-taking
+    POSITION_SIZES = (0.5, 1.0, 1.5, 2.0)  # v27: Doubled for aggressive risk-taking
     # Reward: pure continuous mark-to-market PnL delta (no exit "banking").
     # The agent receives PnL changes as they occur, aligning rewards with the
     # equity curve and avoiding incentive to prematurely close to "lock in" a
@@ -82,7 +83,7 @@ class TradingEnv(gym.Env):
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
         max_steps: int = 500,         # ~1 week for rapid regime cycling
         reward_scaling: float = 0.01,  # NAS100: 1.0 per 100 points (was 1.0 per pip for EURUSD)
-        trade_entry_bonus: float = 0.1,    # v26: Moderate incentive to enter trades
+        trade_entry_bonus: float = 0.05,    # v27: Minimal incentive to enter trades
         holding_bonus: float = 0.0,        # v25: DISABLED - was causing reward inflation
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
@@ -108,7 +109,7 @@ class TradingEnv(gym.Env):
         # OHLC data for visualization (real candle data)
         ohlc_data: Optional[np.ndarray] = None,  # Shape: (n_samples, 4) with [open, high, low, close]
         timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
-        noise_level: float = 0.05,  # v27: Moderate regularization noise
+        noise_level: float = 0.02,  # v26: Reduced noise
         # v16: Sparse Rewards Mode
         use_sparse_rewards: bool = False,  # v25: DISABLED - causes mode collapse
         # v17: Loss Tolerance Buffer
@@ -125,6 +126,8 @@ class TradingEnv(gym.Env):
         agent_lookback_window: int = 0, # How many return bars to see
         # Toggle Analyst usage (if False, agent uses only raw market features)
         use_analyst: bool = False,  # v26: Default False - agent uses raw features only
+        # v27: Rolling window warmup data (market features from before start_idx)
+        rolling_lookback_data: Optional[np.ndarray] = None,
     ):
         """
         Initialize the trading environment.
@@ -322,6 +325,24 @@ class TradingEnv(gym.Env):
         else:
             self.market_feat_mean = None
             self.market_feat_std = None
+
+        # v27: Rolling window normalization for non-stationary financial data
+        # OPTIMIZED: Use numpy circular buffer with running sums for O(1) updates
+        self.rolling_window_size = 5760  # 20 days of 5m bars
+        num_features = n_market_features
+        self.use_rolling_norm = True  # Can be disabled for comparison
+        
+        # Circular buffer for rolling window (much faster than deques)
+        self.rolling_buffer = np.zeros((self.rolling_window_size, num_features), dtype=np.float32)
+        self.rolling_idx = 0  # Current position in circular buffer
+        self.rolling_count = 0  # Number of samples added (up to window_size)
+        
+        # Running sums for O(1) mean/std calculation
+        self.rolling_sum = np.zeros(num_features, dtype=np.float64)  # Use float64 for precision
+        self.rolling_sum_sq = np.zeros(num_features, dtype=np.float64)
+        
+        # v27: Store pre-start lookback data for warmup (injected by factory)
+        self.rolling_lookback_data = rolling_lookback_data
 
         # Episode state
         self.current_idx = self.start_idx
@@ -597,10 +618,55 @@ class TradingEnv(gym.Env):
         # Market features (NORMALIZED to prevent scale inconsistencies)
         if len(self.market_features.shape) > 1:
             market_feat_raw = self.market_features[self.current_idx]
-            # Apply Z-score normalization
-            if self.market_feat_mean is not None and self.market_feat_std is not None:
+            
+            # v27: Rolling window normalization for non-stationary financial data
+            # OPTIMIZED: O(1) incremental updates using running sums
+            rolling_min_samples = 100  # Don't use rolling until we have this many samples
+            has_enough_samples = self.rolling_count >= rolling_min_samples
+            
+            if self.use_rolling_norm and has_enough_samples:
+                # O(1) UPDATE: Evict oldest value if buffer is full, add new value
+                if self.rolling_count >= self.rolling_window_size:
+                    # Evict oldest value from running sums
+                    old_val = self.rolling_buffer[self.rolling_idx]
+                    self.rolling_sum -= old_val
+                    self.rolling_sum_sq -= old_val ** 2
+                
+                # Add new value
+                self.rolling_buffer[self.rolling_idx] = market_feat_raw
+                self.rolling_sum += market_feat_raw
+                self.rolling_sum_sq += market_feat_raw ** 2
+                
+                # Update circular index
+                self.rolling_idx = (self.rolling_idx + 1) % self.rolling_window_size
+                if self.rolling_count < self.rolling_window_size:
+                    self.rolling_count += 1
+                
+                # O(1) mean/std calculation from running sums
+                n = self.rolling_count
+                rolling_means = (self.rolling_sum / n).astype(np.float32)
+                variance = (self.rolling_sum_sq / n) - (rolling_means ** 2)
+                rolling_stds = np.maximum(np.sqrt(np.maximum(variance, 0)), 1e-6).astype(np.float32)
+                
+                # Apply rolling normalization
+                market_feat = ((market_feat_raw - rolling_means) / rolling_stds).astype(np.float32)
+                
+                # Safety clip to ±5.0 to prevent extreme values
+                market_feat = np.clip(market_feat, -5.0, 5.0)
+                
+            # Fallback to global stats if rolling not ready
+            elif self.market_feat_mean is not None and self.market_feat_std is not None:
+                # Still update buffer so it fills up for rolling norm later
+                if self.use_rolling_norm:
+                    self.rolling_buffer[self.rolling_idx] = market_feat_raw
+                    self.rolling_sum += market_feat_raw
+                    self.rolling_sum_sq += market_feat_raw ** 2
+                    self.rolling_idx = (self.rolling_idx + 1) % self.rolling_window_size
+                    self.rolling_count += 1
+                
                 market_feat = ((market_feat_raw - self.market_feat_mean) /
                               self.market_feat_std).astype(np.float32)
+                market_feat = np.clip(market_feat, -5.0, 5.0)
             else:
                 market_feat = market_feat_raw
         else:
@@ -1433,6 +1499,44 @@ class TradingEnv(gym.Env):
         self._holding_bonus_paid = 0.0
         self._holding_bonus_level = 0
 
+        # v27: Warmup rolling window normalization with historical data
+        # OPTIMIZED: Use vectorized numpy operations instead of per-element loops
+        if self.use_rolling_norm and len(self.market_features.shape) > 1:
+            # Reset circular buffer state
+            self.rolling_buffer.fill(0)
+            self.rolling_idx = 0
+            self.rolling_count = 0
+            self.rolling_sum.fill(0)
+            self.rolling_sum_sq.fill(0)
+            
+            # Collect all warmup data
+            warmup_chunks = []
+            
+            # PRIORITY 1: Use injected lookback data from BEFORE start_idx
+            if self.rolling_lookback_data is not None and len(self.rolling_lookback_data) > 0:
+                warmup_chunks.append(self.rolling_lookback_data)
+            
+            # PRIORITY 2: Also use data from within current env range (before current_idx)
+            warmup_start = max(0, self.current_idx - self.rolling_window_size)
+            if warmup_start < self.current_idx:
+                warmup_chunks.append(self.market_features[warmup_start:self.current_idx])
+            
+            # Combine and fill buffer (take last rolling_window_size samples)
+            if warmup_chunks:
+                all_warmup = np.concatenate(warmup_chunks, axis=0) if len(warmup_chunks) > 1 else warmup_chunks[0]
+                # Take last rolling_window_size samples
+                warmup_data = all_warmup[-self.rolling_window_size:] if len(all_warmup) > self.rolling_window_size else all_warmup
+                n_warmup = len(warmup_data)
+                
+                # Fill circular buffer
+                self.rolling_buffer[:n_warmup] = warmup_data
+                self.rolling_idx = n_warmup % self.rolling_window_size
+                self.rolling_count = n_warmup
+                
+                # Compute running sums
+                self.rolling_sum = warmup_data.sum(axis=0).astype(np.float64)
+                self.rolling_sum_sq = (warmup_data ** 2).sum(axis=0).astype(np.float64)
+
         return self._get_observation(), {}
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
@@ -1693,6 +1797,11 @@ def create_env_from_dataframes(
     market_cols = ['atr', 'chop', 'adx', 'regime', 'sma_distance', 'dist_to_support', 'dist_to_resistance']
     available_cols = [c for c in market_cols if c in df_15m.columns]
     market_features = df_15m[available_cols].values[start_idx:start_idx + n_samples].astype(np.float32)
+    
+    # v27: Extract rolling lookback data (data BEFORE start_idx for warmup)
+    rolling_window_size = 5760  # 20 days of 5m bars
+    lookback_start = max(0, start_idx - rolling_window_size)
+    rolling_lookback_data = df_15m[available_cols].values[lookback_start:start_idx].astype(np.float32)
 
     # Extract config values (defaults for NAS100)
     pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
@@ -1705,7 +1814,7 @@ def create_env_from_dataframes(
     reward_scaling = 0.01  # NAS100: 1 reward per 100 points
     holding_bonus = 0.0    # v25: DISABLED - was causing reward inflation
     sl_atr_multiplier = 2.0  # v24: Tighter SL at 2x ATR
-    tp_atr_multiplier = 3.0
+    tp_atr_multiplier = 6.0  # v27: Match config/settings.py and Backtester
     use_stop_loss = True
     use_take_profit = True
     volatility_sizing = True
@@ -1777,5 +1886,7 @@ def create_env_from_dataframes(
         noise_level=noise_level,
         # v26: Early Exit Penalty
         early_exit_penalty=early_exit_penalty,
-        min_bars_before_exit=min_bars_before_exit
+        min_bars_before_exit=min_bars_before_exit,
+        # v27: Rolling window warmup data
+        rolling_lookback_data=rolling_lookback_data
     )
