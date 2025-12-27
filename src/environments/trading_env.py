@@ -44,7 +44,7 @@ class TradingEnv(gym.Env):
     metadata = {'render_modes': ['human']}
 
     # Position sizing multipliers
-    POSITION_SIZES = (0.25, 0.5, 0.75, 1.0)
+    POSITION_SIZES = (1.25, 2.5, 3.75, 5.0)  # v27: 5x original for aggressive risk-taking
     # Reward: pure continuous mark-to-market PnL delta (no exit "banking").
     # The agent receives PnL changes as they occur, aligning rewards with the
     # equity curve and avoiding incentive to prematurely close to "lock in" a
@@ -73,7 +73,7 @@ class TradingEnv(gym.Env):
         pip_value: float = 1.0,       # NAS100: 1 point = 1.0 price movement
         lot_size: float = 1.0,        # NAS100 CFD lot size
         point_multiplier: float = 1.0, # Dollar per point per lot
-        spread_pips: float = 3.5,     # NAS100 spread with buffer
+        spread_pips: float = 50.0,     # NAS100 spread with buffer
         slippage_pips: float = 0.0,   # NAS100 slippage
         fomo_penalty: float = 0.0,  # v26: DEPRECATED - now using opportunity cost
         chop_penalty: float = 0.0,    # Disabled for stability
@@ -82,7 +82,7 @@ class TradingEnv(gym.Env):
         chop_threshold: float = 80.0,     # Only extreme chop triggers penalty
         max_steps: int = 500,         # ~1 week for rapid regime cycling
         reward_scaling: float = 0.01,  # NAS100: 1.0 per 100 points (was 1.0 per pip for EURUSD)
-        trade_entry_bonus: float = 0.0,    # v25: DISABLED - pure PnL rewards only
+        trade_entry_bonus: float = 0.1,    # v26: Moderate incentive to enter trades
         holding_bonus: float = 0.0,        # v25: DISABLED - was causing reward inflation
         device: Optional[torch.device] = None,
         market_feat_mean: Optional[np.ndarray] = None,  # Pre-computed from training data
@@ -108,7 +108,7 @@ class TradingEnv(gym.Env):
         # OHLC data for visualization (real candle data)
         ohlc_data: Optional[np.ndarray] = None,  # Shape: (n_samples, 4) with [open, high, low, close]
         timestamps: Optional[np.ndarray] = None,  # Optional timestamps for real time axis
-        noise_level: float = 0.02,  # v26: Reduced noise
+        noise_level: float = 0.05,  # v27: Moderate regularization noise
         # v16: Sparse Rewards Mode
         use_sparse_rewards: bool = False,  # v25: DISABLED - causes mode collapse
         # v17: Loss Tolerance Buffer
@@ -328,6 +328,7 @@ class TradingEnv(gym.Env):
         self.position = 0  # -1: Short, 0: Flat, 1: Long
         self.position_size = 0.0
         self.entry_price = 0.0
+        self.entry_atr = 0.0  # v27: Store ATR at entry for fixed SL/TP
         self.steps = 0
         self.total_pnl = 0.0
         self.trades = []
@@ -768,11 +769,9 @@ class TradingEnv(gym.Env):
             high_price = close_price
             low_price = close_price
 
-        # Get ATR for dynamic thresholds
-        if len(self.market_features.shape) > 1:
-            atr = self.market_features[self.current_idx, 0]
-        else:
-            atr = 0.001  # Default fallback
+        # v27 FIX: Use ATR stored at entry for FIXED SL/TP levels
+        # This ensures risk is known at entry and doesn't widen during volatility spikes
+        atr = self.entry_atr if self.entry_atr > 0 else (self.market_features[self.current_idx, 0] if len(self.market_features.shape) > 1 else 0.001)
 
         # Calculate dynamic thresholds in pips/points
         sl_pips_threshold = (atr * self.sl_atr_multiplier) / self.pip_value
@@ -1231,6 +1230,7 @@ class TradingEnv(gym.Env):
                 self.position = 1
                 self.position_size = new_size
                 self.entry_price = current_price
+                self.entry_atr = atr  # v27: Store ATR at entry for fixed SL/TP
                 self.entry_idx = self.current_idx  # v18: Track entry bar for min hold time
                 # Reset holding-bonus state for the new trade
                 self._holding_bonus_paid = 0.0
@@ -1296,6 +1296,7 @@ class TradingEnv(gym.Env):
                 self.position = -1
                 self.position_size = new_size
                 self.entry_price = current_price
+                self.entry_atr = atr  # v27: Store ATR at entry for fixed SL/TP
                 self.entry_idx = self.current_idx  # v18: Track entry bar for min hold time
                 # Reset holding-bonus state for the new trade
                 self._holding_bonus_paid = 0.0
@@ -1595,7 +1596,7 @@ def create_env_from_dataframes(
     feature_cols: Optional[list] = None,
     config: Optional[object] = None,
     device: Optional[torch.device] = None,
-    noise_level = 0.02  # v26: Reduced noise
+    noise_level = 0.05  # v27: Moderate regularization noise
 ) -> TradingEnv:
     """
     Factory function to create TradingEnv from DataFrames.
@@ -1695,7 +1696,7 @@ def create_env_from_dataframes(
 
     # Extract config values (defaults for NAS100)
     pip_value = 1.0  # NAS100: 1 point = 1.0 price movement
-    spread_pips = 3.5  # NAS100 spread with buffer
+    spread_pips = 50.0  # NAS100 spread with buffer
     fomo_penalty = 0.0  # v26: DEPRECATED - now using opportunity cost
     chop_penalty = -0.01  # Reduced from -0.1
     fomo_threshold_atr = 4.0  # v25: Trigger on >4x ATR moves

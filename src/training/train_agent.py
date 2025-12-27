@@ -625,7 +625,7 @@ def create_trading_env(
     # Default configuration (matches config/settings.py v16 fixes)
     # FIX v16: After fixing mixed PnL units and inverted entry_price_norm,
     # these defaults now produce correct reward signals
-    spread_pips = 3.5       # NAS100 spread with buffer
+    spread_pips = 50.0       # NAS100 spread with buffer
     slippage_pips = 0.0     # Includes commission + slippage
     fomo_penalty = 0.0  # v26: DEPRECATED - now using opportunity cost
     chop_penalty = 0.0      # Disabled
@@ -635,9 +635,9 @@ def create_trading_env(
     max_steps = 500
     reward_scaling = 0.01    # 1.0 reward per 1 pip (safe after fixing unit bugs)
     context_dim = 64
-    trade_entry_bonus = 0.0  # Pure PnL-driven (no entry bonus)
+    trade_entry_bonus = 0.1  # v26: Moderate incentive to enter trades
     holding_bonus = 0.0      # v25: DISABLED - was causing reward inflation
-    noise_level = 0.02  # v26: Reduced noise
+    noise_level = 0.05  # v27: Moderate regularization noise
 
     # Risk Management defaults
     # v23.6: Updated to 1:2 R/R (was 2.0/12.0 = 1:6 inverted R/R)

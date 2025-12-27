@@ -195,7 +195,7 @@ class TradingConfig:
     # If False, agent trains with only raw market features (no analyst context/metrics)
     use_analyst: bool = False  # v24: Disabled - agent trains with raw features only
 
-    spread_pips: float = 3.5    # NAS100 spread with buffer for realistic execution
+    spread_pips: float = 50.0    # v26: Ultra-high spread to force major trend capture
     slippage_pips: float = 0.0  # NAS100 slippage
 
     # Confidence filtering: Only take trades when agent probability >= threshold
@@ -235,7 +235,7 @@ class TradingConfig:
 
     # Trade entry bonus: Offsets entry cost to encourage exploration
     # NAS100 spread ~2.5 points × 0.01 = 0.025 reward cost, so bonus = 0.01
-    trade_entry_bonus: float = 0.0   # v25: DISABLED - pure PnL rewards only
+    trade_entry_bonus: float = 0.1   # v26: Moderate incentive to enter trades
     
     # v25: Position Holding Bonus - DISABLED to fix reward-PnL divergence
     # Continuous PnL reward already incentivizes holding winners
@@ -275,7 +275,7 @@ class TradingConfig:
     initial_balance: float = 10000.0
     
     # Validation
-    noise_level: float = 0.02  # v26: Reduced noise
+    noise_level: float = 0.05  # v27: Moderate regularization noise
 
     # NEW: "Full Eyes" Agent Features
     agent_lookback_window: int = 12   # Increased to 12 as requested (60 mins of 5m bars)
@@ -320,10 +320,10 @@ class AgentConfig:
     batch_size: int = 256       # v23: 2048/256 = 8 minibatches (was 1024)
     n_epochs: int = 4           # v23: Reduced from 10 to prevent overfitting
     # v23: Standard discount factor for trading (trade-level rewards, not episode-end)
-    gamma: float = 0.995  # v25: Standard gamma for trading
+    gamma: float = 0.99  # v26: Reduced for better EV learning
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.05        # Initial value (decays to 0.001 via EntropyScheduleCallback)
+    ent_coef: float = 0.1        # v27: High exploration for risk-taking
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 

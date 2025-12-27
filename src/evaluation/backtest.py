@@ -111,6 +111,7 @@ class Backtester:
         self.position = 0  # -1, 0, 1
         self.position_size = 0.0
         self.entry_price = 0.0
+        self.entry_atr = 0.0  # v27: Store ATR at entry for fixed SL/TP
         self.entry_time = None
         self.entry_step = 0  # v18: Track entry bar for min hold time
         self.current_step = 0  # v18: Track current bar
@@ -127,6 +128,7 @@ class Backtester:
         self.position = 0
         self.position_size = 0.0
         self.entry_price = 0.0
+        self.entry_atr = 0.0  # v27: Reset entry ATR
         self.entry_time = None
         self.entry_step = 0  # v18: Reset entry step
         self.current_step = 0  # v18: Reset current step
@@ -191,6 +193,7 @@ class Backtester:
         self.position = 0
         self.position_size = 0.0
         self.entry_price = 0.0
+        self.entry_atr = 0.0  # v27: Reset entry ATR
         self.entry_time = None
         self.break_even_activated = False  # v20: Reset break-even flag
 
@@ -202,12 +205,14 @@ class Backtester:
         size: float,
         price: float,
         time: pd.Timestamp,
-        spread_pips: float = 1.5
+        spread_pips: float = 1.5,
+        entry_atr: float = 0.0  # v27: ATR at entry for fixed SL/TP
     ):
         """Open a new position."""
         self.position = direction
         self.position_size = size
         self.entry_price = price
+        self.entry_atr = entry_atr  # v27: Store ATR at entry
         self.entry_time = time
         self.entry_step = self.current_step  # v18: Track entry bar for min hold time
 
@@ -242,9 +247,13 @@ class Backtester:
         if self.position == 0:
             return 0.0, None
 
+        # v27 FIX: Use ATR stored at entry for FIXED SL/TP levels
+        # This ensures risk is known at entry and doesn't widen during volatility spikes
+        atr_for_sl = self.entry_atr if self.entry_atr > 0 else atr
+        
         # Calculate dynamic SL/TP thresholds in points
-        sl_pips_threshold = (atr * self.sl_atr_multiplier) / self.pip_value
-        tp_pips_threshold = (atr * self.tp_atr_multiplier) / self.pip_value
+        sl_pips_threshold = (atr_for_sl * self.sl_atr_multiplier) / self.pip_value
+        tp_pips_threshold = (atr_for_sl * self.tp_atr_multiplier) / self.pip_value
 
         # Ensure minimum values
         sl_pips_threshold = max(sl_pips_threshold, 5.0)
@@ -420,13 +429,13 @@ class Backtester:
             if self.position == -1:  # Close short first
                 pnl += self._close_position(close, time)
             if self.position == 0:  # Open long
-                self._open_position(1, size, close, time, spread_pips)
+                self._open_position(1, size, close, time, spread_pips, entry_atr=atr)
 
         elif direction == 2:  # Short
             if self.position == 1:  # Close long first
                 pnl += self._close_position(close, time)
             if self.position == 0:  # Open short
-                self._open_position(-1, size, close, time, spread_pips)
+                self._open_position(-1, size, close, time, spread_pips, entry_atr=atr)
 
         # v18: Increment current step counter
         self.current_step += 1
